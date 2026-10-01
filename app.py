@@ -99,7 +99,6 @@ def iniciar_bgutil_provider() -> None:
     if marker.exists():
         # Verifica se há um servidor respondendo.
         try:
-            import urllib.request
             with urllib.request.urlopen("http://127.0.0.1:4416/ping", timeout=1):
                 return
         except Exception:
