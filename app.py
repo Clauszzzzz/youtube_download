@@ -1018,10 +1018,10 @@ def _opcoes_download_por_cliente(
 ) -> Dict[str, Any]:
     """Monta uma estratégia de download isolada por cliente do YouTube.
 
-    A estratégia é escolhida por cliente. Em V14, são testados web_embedded e
+    A estratégia é escolhida por cliente. Em V15, são testados web_embedded e
     android_vr sem configurar BgUtils/mweb, para separar o problema do fluxo mweb/PO Token.
     """
-    # V14: os clientes deste experimento não usam BgUtils/mweb.
+    # V15: os clientes deste experimento não usam BgUtils/mweb.
     deno = shutil.which("deno")
     if not deno:
         raise RuntimeError("Deno não foi encontrado no servidor.")
@@ -1061,7 +1061,7 @@ def _opcoes_download_por_cliente(
             "player_client": [cliente],
         },
     }
-    # O teste V14 de web_embedded precisa ser realmente independente do BgUtils.
+    # O teste V15 de web_embedded precisa ser realmente independente do BgUtils.
     # Para mweb, preservamos a possibilidade de usar o provider explícito em
     # testes futuros; para web_embedded, não há motivo para inicializar o provider.
 
@@ -1157,12 +1157,12 @@ def baixar_e_converter(
 
     url_normalizada = normalizar_url(url)
 
-    # V14: testar dois clientes que, segundo a documentação atual do yt-dlp,
+    # V15: testar dois clientes que, segundo a documentação atual do yt-dlp,
     # não dependem do fluxo mweb + PO Token. O objetivo é descobrir se o bloqueio
     # é específico do GVS/mweb. Não configuramos BgUtils nesta etapa.
     estrategias = [
+        _opcoes_download_por_cliente("android", formato_escolhido, qualidade),
         _opcoes_download_por_cliente("web_embedded", formato_escolhido, qualidade),
-        _opcoes_download_por_cliente("android_vr", formato_escolhido, qualidade),
     ]
 
     diagnostico_download = {
@@ -1174,7 +1174,7 @@ def baixar_e_converter(
         "cliente_sucesso": None,
         "tentativas": [],
         "observacao": (
-            "Teste V14 sem mweb/BgUtils. Primeiro web_embedded e, se necessário, "
+            "Teste V15 sem mweb/BgUtils. Primeiro web_embedded e, se necessário, "
             "android_vr. O objetivo é testar caminhos que não dependam do fluxo mweb + PO Token."
         ),
     }
@@ -1245,7 +1245,7 @@ def mostrar_metadados(info: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.title("🎬 YouTube Downloader — Diagnóstico Completo V14")
+    st.title("🎬 YouTube Downloader — Diagnóstico Completo V15")
     st.caption("MP4 com áudio ou extração de áudio MP3 — processamento realizado no servidor.")
     st.info("Use somente conteúdo que você tenha autorização para baixar ou que seja permitido pelos termos e direitos aplicáveis.")
 
