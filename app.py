@@ -1018,29 +1018,24 @@ def _opcoes_download_por_cliente(
 ) -> Dict[str, Any]:
     """Monta uma estratégia de download isolada por cliente do YouTube.
 
-    A estratégia é escolhida por cliente. Em V13, o cliente web_safari é
-    usado isoladamente para testar HLS sem depender do fluxo mweb/PO Token.
+    A estratégia é escolhida por cliente. Em V14, são testados web_embedded e
+    android_vr sem configurar BgUtils/mweb, para separar o problema do fluxo mweb/PO Token.
     """
-    if cliente == "web_safari":
-        # V13: não inicializar o BgUtils para o experimento web_safari.
-        # O cliente será testado de forma independente; Deno continua disponível
-        # apenas como runtime JS para o yt-dlp, se ele precisar resolver desafios.
-        deno = shutil.which("deno")
-        if not deno:
-            raise RuntimeError("Deno não foi encontrado no servidor.")
-        op_js = {"js_runtimes": {"deno": {"path": deno}}}
-    else:
-        op_js = _opcoes_js()
+    # V14: os clientes deste experimento não usam BgUtils/mweb.
+    deno = shutil.which("deno")
+    if not deno:
+        raise RuntimeError("Deno não foi encontrado no servidor.")
+    op_js = {"js_runtimes": {"deno": {"path": deno}}}
 
     if formato_escolhido == "video":
-        if cliente == "web_safari":
-            # web_safari pode fornecer HLS pré-muxado (vídeo + áudio), que é
-            # justamente o caminho que queremos testar antes do GVS mweb.
+        if cliente == "web_embedded":
             seletor = (
-                f"best[protocol^=m3u8][height<={qualidade}]/"
+                f"bestvideo[height<={qualidade}]+bestaudio/"
                 f"best[height<={qualidade}]/best"
             )
         else:
+            # android_vr pode oferecer apenas formatos combinados em algumas
+            # sessões; manter fallback para best torna o teste diagnóstico.
             seletor = (
                 f"bestvideo[height<={qualidade}]+bestaudio/"
                 f"best[height<={qualidade}]/best"
@@ -1048,10 +1043,7 @@ def _opcoes_download_por_cliente(
         extensao_final = ".mp4"
         extras = {"format": seletor, "merge_output_format": "mp4"}
     elif formato_escolhido == "audio":
-        if cliente == "web_safari":
-            seletor = "best[protocol^=m3u8]/bestaudio/best"
-        else:
-            seletor = "bestaudio/best"
+        seletor = "bestaudio/best"
         extensao_final = ".mp3"
         extras = {
             "format": seletor,
@@ -1069,11 +1061,9 @@ def _opcoes_download_por_cliente(
             "player_client": [cliente],
         },
     }
-    # O teste V13 de web_safari precisa ser realmente independente do BgUtils.
+    # O teste V14 de web_embedded precisa ser realmente independente do BgUtils.
     # Para mweb, preservamos a possibilidade de usar o provider explícito em
-    # testes futuros; para web_safari, não há motivo para inicializar o provider.
-    if cliente != "web_safari":
-        extractor_args.update(_opcoes_provider())
+    # testes futuros; para web_embedded, não há motivo para inicializar o provider.
 
     return {
         "cliente": cliente,
@@ -1167,26 +1157,25 @@ def baixar_e_converter(
 
     url_normalizada = normalizar_url(url)
 
-    # V13 é um experimento isolado: testa apenas o cliente web_safari.
-    # Não configuramos BgUtils/mweb nesta tentativa, para retirar PO Token/GVS
-    # mweb da equação. Se funcionar, sabemos que o caminho HLS/web_safari é
-    # utilizável neste ambiente. Se falhar, o diagnóstico fica limpo para o
-    # próximo teste (por exemplo, android_vr).
+    # V14: testar dois clientes que, segundo a documentação atual do yt-dlp,
+    # não dependem do fluxo mweb + PO Token. O objetivo é descobrir se o bloqueio
+    # é específico do GVS/mweb. Não configuramos BgUtils nesta etapa.
     estrategias = [
-        _opcoes_download_por_cliente("web_safari", formato_escolhido, qualidade),
+        _opcoes_download_por_cliente("web_embedded", formato_escolhido, qualidade),
+        _opcoes_download_por_cliente("android_vr", formato_escolhido, qualidade),
     ]
 
     diagnostico_download = {
         "url": url_normalizada,
         "tipo": formato_escolhido,
         "qualidade_solicitada": qualidade,
-        "tentativa": "download_real_v13_web_safari",
+        "tentativa": "download_real_v14_web_embedded",
         "resultado": "falha",
         "cliente_sucesso": None,
         "tentativas": [],
         "observacao": (
-            "Teste isolado do cliente web_safari. BgUtils e mweb não são "
-            "configurados nesta tentativa, para testar o caminho HLS sem PO Token."
+            "Teste V14 sem mweb/BgUtils. Primeiro web_embedded e, se necessário, "
+            "android_vr. O objetivo é testar caminhos que não dependam do fluxo mweb + PO Token."
         ),
     }
 
@@ -1256,7 +1245,7 @@ def mostrar_metadados(info: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.title("🎬 YouTube Downloader — Diagnóstico Completo V13")
+    st.title("🎬 YouTube Downloader — Diagnóstico Completo V14")
     st.caption("MP4 com áudio ou extração de áudio MP3 — processamento realizado no servidor.")
     st.info("Use somente conteúdo que você tenha autorização para baixar ou que seja permitido pelos termos e direitos aplicáveis.")
 
