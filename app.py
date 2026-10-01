@@ -308,20 +308,17 @@ def preparar_ambiente() -> Dict[str, Any]:
 
 
 def _opcoes_provider() -> Dict[str, Dict[str, Any]]:
-    ambiente = preparar_ambiente()
+    """Retorna o provider BgUtils somente quando o script realmente existe.
+
+    A V15 não depende de BgUtils/mweb para os testes android/web_embedded.
+    Portanto, a ausência de generate_once.js não pode bloquear a análise do vídeo.
+    """
     server_home = str(BGUTIL_SERVER)
     script = str(BGUTIL_SERVER / "build" / "generate_once.js")
 
-    if not Path(server_home).is_dir():
-        raise RuntimeError(f"Pasta do BgUtils não encontrada: {server_home}")
-    if not Path(script).is_file():
-        raise RuntimeError(f"Script generate_once.js não encontrado: {script}")
+    if not Path(server_home).is_dir() or not Path(script).is_file():
+        return {}
 
-    # V12: configurar explicitamente o provider em modo script.
-    # O diagnóstico anterior mostrou que o plugin tentava procurar o script
-    # em ~/bgutil-ytdlp-pot-provider, mas a instalação real está no cache.
-    # A documentação oficial do BgUtils recomenda server_home quando o script
-    # está instalado em um local diferente do padrão.
     return {
         "youtubepot-bgutilscript": {
             "server_home": server_home,
@@ -801,15 +798,15 @@ def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     ambiente = preparar_ambiente()
     logger = DiagnosticoLogger()
     op_js = _opcoes_js()
-    op_provider = _opcoes_provider()
 
     extractor_args = {
         **op_js.get("extractor_args", {}),
         "youtube": {
             **op_js.get("extractor_args", {}).get("youtube", {}),
             "pot_trace": ["true"],
+            # V15 testa clientes que não dependem de mweb/BgUtils.
+            "player_client": ["android"],
         },
-        **op_provider,
     }
 
     ydl_opts = {
@@ -888,7 +885,10 @@ def extrair_info_video(url: str) -> Dict[str, Any]:
         **_opcoes_js(),
         "extractor_args": {
             **_opcoes_js().get("extractor_args", {}),
-            **_opcoes_provider(),
+            "youtube": {
+                **_opcoes_js().get("extractor_args", {}).get("youtube", {}),
+                "player_client": ["android"],
+            },
         },
     }
 
@@ -1018,8 +1018,8 @@ def _opcoes_download_por_cliente(
 ) -> Dict[str, Any]:
     """Monta uma estratégia de download isolada por cliente do YouTube.
 
-    A estratégia é escolhida por cliente. Em V15, são testados web_embedded e
-    android_vr sem configurar BgUtils/mweb, para separar o problema do fluxo mweb/PO Token.
+    A estratégia é escolhida por cliente. Em V15, são testados android e
+    web_embedded sem configurar BgUtils/mweb, para separar o problema do fluxo mweb/PO Token.
     """
     # V15: os clientes deste experimento não usam BgUtils/mweb.
     deno = shutil.which("deno")
@@ -1169,13 +1169,13 @@ def baixar_e_converter(
         "url": url_normalizada,
         "tipo": formato_escolhido,
         "qualidade_solicitada": qualidade,
-        "tentativa": "download_real_v14_web_embedded",
+        "tentativa": "download_real_v15_android_web_embedded",
         "resultado": "falha",
         "cliente_sucesso": None,
         "tentativas": [],
         "observacao": (
-            "Teste V15 sem mweb/BgUtils. Primeiro web_embedded e, se necessário, "
-            "android_vr. O objetivo é testar caminhos que não dependam do fluxo mweb + PO Token."
+            "Teste V15 sem mweb/BgUtils. Primeiro android e, se necessário, "
+            "web_embedded. O objetivo é testar caminhos que não dependam do fluxo mweb + PO Token."
         ),
     }
 
