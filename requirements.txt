@@ -1,3 +1,4 @@
 streamlit
 yt-dlp[default]
 deno==2.9.7
+bgutil-ytdlp-pot-provider==2.0.0
