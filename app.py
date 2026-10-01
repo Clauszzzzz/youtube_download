@@ -1105,7 +1105,7 @@ def _download_uma_estrategia(
         "progress_hooks": [progress.hook] if progress else [],
         "logger": logger,
         "outtmpl": str(Path(pasta_destino) / "%(title).180s.%(ext)s"),
-        "js_runtimes": op_js.get("js_runtimes"),
+        "js_runtimes": estrategia.get("js_runtimes"),
         "extractor_args": estrategia["extractor_args"],
         "format": estrategia["format"],
     }
