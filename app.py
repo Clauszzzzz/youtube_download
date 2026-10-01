@@ -1,6 +1,12 @@
 import os
 import re
 import shutil
+import importlib
+import importlib.metadata
+import json
+import platform
+import sys
+import traceback
 import subprocess
 import tarfile
 import tempfile
@@ -247,18 +253,30 @@ def _opcoes_js() -> Dict[str, Any]:
 
 
 class DiagnosticoLogger:
-    """Captura logs do yt-dlp para verificar provider/PO Token sem expor tokens."""
+    """Captura logs completos do yt-dlp com redacao de segredos."""
 
     def __init__(self) -> None:
         self.linhas: list[str] = []
 
+    @staticmethod
+    def _redact(texto: str) -> str:
+        patterns = [
+            (r'(?i)(authorization\s*[:=]\s*)\S+', r'\1[OCULTO]'),
+            (r'(?i)(cookie\s*[:=]\s*)\S+', r'\1[OCULTO]'),
+            (r'(?i)(po.?token[^=:\n]*[=:]\s*)[^\s,;]+', r'\1[OCULTO]'),
+            (r'(?i)(content[-_ ]binding[^=:\n]*[=:]\s*)[^\s,;]+', r'\1[OCULTO]'),
+            (r'(?i)(visitor[-_ ]data[^=:\n]*[=:]\s*)[^\s,;]+', r'\1[OCULTO]'),
+            (r'(?i)(data[-_ ]sync[-_ ]id[^=:\n]*[=:]\s*)[^\s,;]+', r'\1[OCULTO]'),
+            (r'(?i)(proxy[^=:\n]*[=:]\s*)(https?://)?[^ \n]+@', r'\1[OCULTO]@'),
+        ]
+        for pattern, replacement in patterns:
+            texto = re.sub(pattern, replacement, texto)
+        if len(texto) > 5000:
+            texto = texto[:5000] + " …[linha truncada]"
+        return texto
+
     def _guardar(self, mensagem: Any) -> None:
-        texto = str(mensagem)
-        # Não exibimos valores que possam ser tokens, cookies ou URLs enormes.
-        texto = re.sub(r"(?i)(po.?token[^=:\n]*[=:]\s*)[^\s,;]+", r"\1[OCULTO]", texto)
-        if len(texto) > 1800:
-            texto = texto[:1800] + " …"
-        self.linhas.append(texto)
+        self.linhas.append(self._redact(str(mensagem)))
 
     def debug(self, msg: str) -> None:
         self._guardar(msg)
@@ -273,45 +291,222 @@ class DiagnosticoLogger:
         self._guardar("ERROR: " + msg)
 
 
-def _resumo_diagnostico(info: Dict[str, Any], logger: DiagnosticoLogger, ambiente: Dict[str, str]) -> Dict[str, Any]:
-    linhas_provider = []
-    linhas_pot = []
-    linhas_sabr = []
-    for linha in logger.linhas:
-        low = linha.lower()
-        if "po token providers" in low or "pot:bgutil" in low or "pot]" in low:
-            linhas_pot.append(linha)
-        if "sabr" in low or "missing a url" in low:
-            linhas_sabr.append(linha)
-        if "plugin director" in low or "loaded " in low and "extractor" in low:
-            linhas_provider.append(linha)
+def _executar_comando(cmd: list[str], cwd: Optional[Path] = None, timeout: int = 30) -> Dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+            env=os.environ.copy(),
+        )
+        return {
+            "comando": " ".join(cmd),
+            "returncode": proc.returncode,
+            "timeout": False,
+            "saida": DiagnosticoLogger._redact(proc.stdout or "")[-12000:],
+        }
+    except subprocess.TimeoutExpired as exc:
+        saida = exc.stdout or ""
+        if isinstance(saida, bytes):
+            saida = saida.decode("utf-8", "replace")
+        return {
+            "comando": " ".join(cmd),
+            "returncode": None,
+            "timeout": True,
+            "saida": DiagnosticoLogger._redact(saida)[-12000:],
+        }
+    except Exception as exc:
+        return {
+            "comando": " ".join(cmd),
+            "returncode": None,
+            "timeout": False,
+            "saida": f"{type(exc).__name__}: {exc}",
+        }
 
+
+def _arquivos_relevantes(raiz: Path, limite: int = 300) -> list[Dict[str, Any]]:
+    encontrados = []
+    if not raiz.exists():
+        return encontrados
+    try:
+        for item in sorted(raiz.rglob("*")):
+            if len(encontrados) >= limite:
+                break
+            try:
+                if item.is_file():
+                    encontrados.append({
+                        "arquivo": str(item.relative_to(raiz)),
+                        "bytes": item.stat().st_size,
+                        "ext": item.suffix,
+                    })
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return encontrados
+
+
+def _modulos_bgutil() -> Dict[str, Any]:
+    resultado = {
+        "distribuicoes": [],
+        "modulos_encontrados": [],
+        "erros_importacao": [],
+    }
+
+    try:
+        for dist in importlib.metadata.distributions():
+            nome = (dist.metadata.get("Name") or "").lower()
+            if "bgutil" in nome:
+                arquivos = [str(f) for f in (dist.files or [])
+                            if "bgutil" in str(f).lower() or "ytdlp_plugins" in str(f).lower()]
+                resultado["distribuicoes"].append({
+                    "name": dist.metadata.get("Name"),
+                    "version": dist.version,
+                    "location": str(dist.locate_file("")),
+                    "arquivos": arquivos[:300],
+                })
+    except Exception as exc:
+        resultado["erros_importacao"].append(f"metadata: {type(exc).__name__}: {exc}")
+
+    for nome in ("yt_dlp_plugins", "yt_dlp_plugins.extractor", "yt_dlp_plugins.extractor.youtube"):
+        try:
+            mod = importlib.import_module(nome)
+            resultado["modulos_encontrados"].append({
+                "modulo": nome,
+                "arquivo": getattr(mod, "__file__", None),
+                "caminho": [str(x) for x in getattr(mod, "__path__", [])],
+            })
+        except Exception as exc:
+            resultado["erros_importacao"].append(
+                f"import {nome}: {type(exc).__name__}: {exc}"
+            )
+    return resultado
+
+
+def _variaveis_ambiente_relevantes() -> Dict[str, str]:
+    nomes = [
+        "HOME", "USER", "USERNAME", "PATH", "PYTHONPATH", "VIRTUAL_ENV",
+        "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "YTDLP_NO_PLUGINS",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    ]
+    out = {}
+    for nome in nomes:
+        valor = os.environ.get(nome)
+        if valor is not None:
+            if nome in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"}:
+                valor = re.sub(r'(?i)(https?://)([^/@]+)@', r'\1[OCULTO]@', valor)
+            out[nome] = valor
+    return out
+
+def _resumo_diagnostico(info: Dict[str, Any], logger: DiagnosticoLogger, ambiente: Dict[str, str]) -> Dict[str, Any]:
     formatos = []
     for fmt in info.get("formats", []):
-        if fmt.get("vcodec") not in (None, "none"):
-            formatos.append({
-                "id": fmt.get("format_id"),
-                "height": fmt.get("height"),
-                "width": fmt.get("width"),
-                "ext": fmt.get("ext"),
-                "vcodec": fmt.get("vcodec"),
-                "acodec": fmt.get("acodec"),
-                "protocol": fmt.get("protocol"),
-                "has_url": bool(fmt.get("url")),
-            })
+        formatos.append({
+            "id": fmt.get("format_id"),
+            "height": fmt.get("height"),
+            "width": fmt.get("width"),
+            "fps": fmt.get("fps"),
+            "ext": fmt.get("ext"),
+            "vcodec": fmt.get("vcodec"),
+            "acodec": fmt.get("acodec"),
+            "protocol": fmt.get("protocol"),
+            "tbr": fmt.get("tbr"),
+            "vbr": fmt.get("vbr"),
+            "abr": fmt.get("abr"),
+            "filesize": fmt.get("filesize") or fmt.get("filesize_approx"),
+            "has_url": bool(fmt.get("url")),
+            "format_note": fmt.get("format_note"),
+        })
+
+    try:
+        plugin_dirs = [str(p) for p in yt_dlp.plugins.directories()]
+    except Exception as exc:
+        plugin_dirs = [f"ERRO AO CONSULTAR: {type(exc).__name__}: {exc}"]
+
+    possiveis_raizes = [
+        Path.home() / "yt-dlp-plugins",
+        Path.home() / ".config" / "yt-dlp" / "plugins",
+        Path.home() / ".local" / "share" / "yt-dlp" / "plugins",
+        BGUTIL_DIR,
+        BGUTIL_SERVER,
+    ]
+    possiveis_raizes.extend(Path(x) for x in plugin_dirs if x)
+
+    filesystem = {}
+    for raiz in possiveis_raizes:
+        chave = str(raiz)
+        if chave not in filesystem:
+            filesystem[chave] = {
+                "existe": raiz.exists(),
+                "is_dir": raiz.is_dir(),
+                "arquivos": _arquivos_relevantes(raiz),
+            }
+
+    comandos = {}
+    comandos_def = {
+        "python": [sys.executable, "--version"],
+        "yt-dlp": [sys.executable, "-m", "yt_dlp", "--version"],
+        "deno": [ambiente.get("deno") or "deno", "--version"],
+        "node": ["node", "--version"],
+        "npm": ["npm", "--version"],
+        "npx": ["npx", "--version"],
+        "ffmpeg": ["ffmpeg", "-version"],
+        "ffprobe": ["ffprobe", "-version"],
+    }
+    for nome, cmd in comandos_def.items():
+        comandos[nome] = _executar_comando(cmd, timeout=25)
+
+    script = Path(ambiente.get("script", ""))
+    if script.is_file() and ambiente.get("deno"):
+        comandos["deno_generate_once_version"] = _executar_comando(
+            [ambiente["deno"], str(script), "--version"],
+            cwd=BGUTIL_SERVER,
+            timeout=45,
+        )
+        comandos["deno_generate_once_verbose"] = _executar_comando(
+            [ambiente["deno"], str(script), "--verbose"],
+            cwd=BGUTIL_SERVER,
+            timeout=45,
+        )
 
     return {
         "yt_dlp": getattr(yt_dlp.version, "__version__", "desconhecida"),
-        "python": __import__("sys").version.split()[0],
+        "python": sys.version,
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "cwd": os.getcwd(),
+        "home": str(Path.home()),
         "deno": ambiente.get("deno") or "não encontrado",
         "script": ambiente.get("script") or "não definido",
-        "script_existe": Path(ambiente.get("script", "")).is_file(),
-        "plugin_dirs": [str(p) for p in yt_dlp.plugins.directories()],
-        "pot_logs": linhas_pot[-40:],
-        "provider_logs": linhas_provider[-20:],
-        "sabr_logs": linhas_sabr[-20:],
+        "script_existe": script.is_file(),
+        "script_bytes": script.stat().st_size if script.is_file() else None,
+        "bgutil_dir": str(BGUTIL_DIR),
+        "bgutil_server": str(BGUTIL_SERVER),
+        "plugin_dirs": plugin_dirs,
+        "plugin_modules": _modulos_bgutil(),
+        "environment": _variaveis_ambiente_relevantes(),
+        "filesystem": filesystem,
+        "commands": comandos,
+        "logs_completos": logger.linhas[-500:],
         "formatos": formatos,
+        "info_resumo": {
+            "id": info.get("id"),
+            "title": info.get("title"),
+            "extractor": info.get("extractor"),
+            "extractor_key": info.get("extractor_key"),
+            "duration": info.get("duration"),
+            "format_count": len(info.get("formats") or []),
+        },
     }
+
+class DiagnosticoErro(Exception):
+    def __init__(self, diagnostico: Dict[str, Any]):
+        self.diagnostico = diagnostico
+        super().__init__(diagnostico.get("erro_extracao", "Falha no diagnóstico."))
 
 
 def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -320,6 +515,18 @@ def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
 
     ambiente = preparar_ambiente()
     logger = DiagnosticoLogger()
+    op_js = _opcoes_js()
+    op_provider = _opcoes_provider()
+
+    extractor_args = {
+        **op_js.get("extractor_args", {}),
+        "youtube": {
+            **op_js.get("extractor_args", {}).get("youtube", {}),
+            "pot_trace": ["true"],
+        },
+        **op_provider,
+    }
+
     ydl_opts = {
         "quiet": True,
         "no_warnings": False,
@@ -330,22 +537,30 @@ def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "retries": 2,
         "fragment_retries": 2,
         "logger": logger,
-        **_opcoes_js(),
-        "extractor_args": {
-            **_opcoes_js().get("extractor_args", {}),
-            "youtube": {
-                **_opcoes_js().get("extractor_args", {}).get("youtube", {}),
-                "pot_trace": ["true"],
-            },
-            **_opcoes_provider(),
-        },
+        "js_runtimes": op_js["js_runtimes"],
+        "remote_components": op_js["remote_components"],
+        "extractor_args": extractor_args,
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(normalizar_url(url), download=False)
+    config = {
+        "js_runtimes": op_js.get("js_runtimes"),
+        "remote_components": op_js.get("remote_components"),
+        "extractor_args": extractor_args,
+    }
 
-    return info, _resumo_diagnostico(info, logger, ambiente)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(normalizar_url(url), download=False)
+    except Exception:
+        dummy_info = {"formats": []}
+        diag = _resumo_diagnostico(dummy_info, logger, ambiente)
+        diag["erro_extracao"] = DiagnosticoLogger._redact(traceback.format_exc())
+        diag["config_efetiva"] = config
+        raise DiagnosticoErro(diag)
 
+    diag = _resumo_diagnostico(info, logger, ambiente)
+    diag["config_efetiva"] = config
+    return info, diag
 
 def extrair_info_video(url: str) -> Dict[str, Any]:
     if not url or not url.strip():
@@ -571,7 +786,7 @@ def mostrar_metadados(info: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.title("🎬 YouTube Downloader — Diagnóstico PO Token")
+    st.title("🎬 YouTube Downloader — Diagnóstico Completo")
     st.caption("MP4 com áudio ou extração de áudio MP3 — processamento realizado no servidor.")
     st.info("Use somente conteúdo que você tenha autorização para baixar ou que seja permitido pelos termos e direitos aplicáveis.")
 
@@ -608,8 +823,13 @@ def main() -> None:
                     st.session_state["diagnostico"] = diag
                     st.session_state["video_info"] = info_diag
                     st.session_state["video_url"] = normalizar_url(url)
+                except DiagnosticoErro as exc:
+                    st.session_state["diagnostico"] = exc.diagnostico
                 except Exception as exc:
-                    st.session_state["diagnostico"] = {"erro": str(exc)}
+                    st.session_state["diagnostico"] = {
+                        "erro": f"{type(exc).__name__}: {exc}",
+                        "erro_extracao": traceback.format_exc(),
+                    }
 
     if analisar:
         if not url.strip():
@@ -627,32 +847,74 @@ def main() -> None:
 
     diag = st.session_state.get("diagnostico")
     if diag:
-        with st.expander("🧪 Diagnóstico técnico", expanded=True):
+        with st.expander("🧪 Diagnóstico técnico completo", expanded=True):
             if diag.get("erro"):
                 st.error(diag["erro"])
+            if diag.get("erro_extracao"):
+                st.error("A extração falhou, mas todo o diagnóstico do ambiente foi preservado.")
+                st.code(diag["erro_extracao"], language="text")
+
+            st.subheader("1. Ambiente")
+            st.json({
+                "yt_dlp": diag.get("yt_dlp"),
+                "python": diag.get("python"),
+                "python_executable": diag.get("python_executable"),
+                "platform": diag.get("platform"),
+                "machine": diag.get("machine"),
+                "cwd": diag.get("cwd"),
+                "home": diag.get("home"),
+            })
+
+            st.subheader("2. BgUtils / Deno")
+            st.json({
+                "deno": diag.get("deno"),
+                "bgutil_dir": diag.get("bgutil_dir"),
+                "bgutil_server": diag.get("bgutil_server"),
+                "generate_once_js": diag.get("script"),
+                "generate_once_existe": diag.get("script_existe"),
+                "generate_once_bytes": diag.get("script_bytes"),
+            })
+
+            st.subheader("3. Configuração efetiva do yt-dlp")
+            st.json(diag.get("config_efetiva", {}))
+
+            st.subheader("4. Descoberta do plugin")
+            st.write("**Diretórios de plugins vistos pelo yt-dlp:**")
+            st.code("\n".join(diag.get("plugin_dirs") or ["nenhum detectado"]))
+            st.json(diag.get("plugin_modules", {}))
+
+            st.subheader("5. Arquivos relevantes")
+            for raiz, dados in (diag.get("filesystem") or {}).items():
+                with st.expander(f"`{raiz}` — {'EXISTE' if dados.get('existe') else 'não existe'}"):
+                    st.json(dados)
+
+            st.subheader("6. Runtimes e ferramentas")
+            st.json(diag.get("commands", {}))
+
+            st.subheader("7. Variáveis de ambiente relevantes")
+            st.json(diag.get("environment", {}))
+
+            st.subheader("8. Logs completos do yt-dlp / BgUtils / PO Token")
+            st.code("\n".join(diag.get("logs_completos") or ["Nenhum log foi capturado."]), language="text")
+
+            st.subheader("9. Resumo da extração")
+            st.json(diag.get("info_resumo", {}))
+
+            st.subheader("10. Formatos retornados pelo YouTube")
+            formatos_diag = diag.get("formatos") or []
+            if formatos_diag:
+                st.dataframe(formatos_diag, use_container_width=True, hide_index=True)
             else:
-                st.write(f"**yt-dlp:** `{diag.get('yt_dlp')}`")
-                st.write(f"**Python:** `{diag.get('python')}`")
-                st.write(f"**Deno:** `{diag.get('deno')}`")
-                st.write(f"**BgUtils script:** `{diag.get('script')}`")
-                st.write("**Configuração do runtime JS:** `Deno com caminho explícito`")
-                st.write(f"**generate_once.js existe:** `{diag.get('script_existe')}`")
-                st.write("**Diretórios de plugins detectados:**")
-                st.code("\n".join(diag.get("plugin_dirs") or ["nenhum detectado"]))
+                st.warning("Nenhum formato foi retornado.")
 
-                st.write("**Logs de PO Token / BgUtils:**")
-                st.code("\n".join(diag.get("pot_logs") or ["Nenhuma linha de PO Token foi registrada."]))
-
-                if diag.get("sabr_logs"):
-                    st.write("**Avisos relacionados a SABR:**")
-                    st.code("\n".join(diag["sabr_logs"]))
-
-                st.write("**Formatos de vídeo realmente retornados pelo yt-dlp:**")
-                formatos_diag = diag.get("formatos") or []
-                if formatos_diag:
-                    st.dataframe(formatos_diag, use_container_width=True, hide_index=True)
-                else:
-                    st.warning("O yt-dlp não retornou nenhuma stream de vídeo.")
+            diagnostico_json = json.dumps(diag, ensure_ascii=False, indent=2, default=str)
+            st.download_button(
+                "📄 Baixar diagnóstico completo (JSON)",
+                data=diagnostico_json.encode("utf-8"),
+                file_name="diagnostico_yt_dlp_bgutil.json",
+                mime="application/json",
+                use_container_width=True,
+            )
 
     info = st.session_state.get("video_info")
     if not info:
