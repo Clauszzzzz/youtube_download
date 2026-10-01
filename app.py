@@ -383,6 +383,34 @@ class DiagnosticoLogger:
         self._guardar("ERROR: " + msg)
 
 
+class DownloadDiagnosticoLogger(DiagnosticoLogger):
+    """Captura o log real da tentativa de download sem expor segredos."""
+
+    def resumo(self) -> str:
+        return "\n".join(self.linhas[-400:])
+
+
+def _arquivos_da_pasta(pasta: str) -> list[Dict[str, Any]]:
+    resultado = []
+    raiz = Path(pasta)
+    if not raiz.exists():
+        return resultado
+    try:
+        for item in sorted(raiz.iterdir()):
+            if item.is_file():
+                try:
+                    resultado.append({
+                        "arquivo": item.name,
+                        "bytes": item.stat().st_size,
+                        "ext": item.suffix,
+                    })
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return resultado
+
+
 def _executar_comando(cmd: list[str], cwd: Optional[Path] = None, timeout: int = 30) -> Dict[str, Any]:
     try:
         proc = subprocess.run(
@@ -986,15 +1014,19 @@ def baixar_e_converter(
     if progress:
         progress.iniciar()
 
+    download_logger = DownloadDiagnosticoLogger()
+
     common = {
         "noplaylist": True,
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
+        "verbose": True,
         "socket_timeout": 30,
         "retries": 4,
         "fragment_retries": 4,
         "concurrent_fragment_downloads": 4,
         "progress_hooks": [progress.hook] if progress else [],
+        "logger": download_logger,
         "outtmpl": str(Path(pasta_destino) / "%(title).180s.%(ext)s"),
         **_opcoes_js(),
         "extractor_args": {
@@ -1005,8 +1037,8 @@ def baixar_e_converter(
 
     if formato_escolhido == "video":
         common.update({
-            # Não restringe a MP4/M4A. Streams de alta resolução do YouTube
-            # podem ser WebM/VP9/AV1 e ainda podem ser processadas pelo FFmpeg.
+            # Mantemos o seletor original, mas o log verbose registra exatamente
+            # quais format_ids o yt-dlp escolheu antes de iniciar cada stream.
             "format": (
                 f"bestvideo[height<={qualidade}]+bestaudio/"
                 f"best[height<={qualidade}]/best"
@@ -1027,22 +1059,85 @@ def baixar_e_converter(
     else:
         raise ValueError("Tipo de mídia inválido.")
 
+    url_normalizada = normalizar_url(url)
+
+    diagnostico_download = {
+        "url": url_normalizada,
+        "tipo": formato_escolhido,
+        "qualidade_solicitada": qualidade,
+        "format_selector": common.get("format"),
+        "merge_output_format": common.get("merge_output_format"),
+        "extractor_args": common.get("extractor_args"),
+        "js_runtimes": common.get("js_runtimes"),
+        "tentativa": "download_real",
+        "resultado": None,
+        "erro": None,
+        "arquivos_na_pasta_antes": _arquivos_da_pasta(pasta_destino),
+    }
+
     try:
         with yt_dlp.YoutubeDL(common) as ydl:
-            ydl.download([normalizar_url(url)])
+            retorno = ydl.download([url_normalizada])
+
+        diagnostico_download["resultado"] = {
+            "returncode": retorno,
+            "status": "concluido" if retorno == 0 else "retorno_nao_zero",
+        }
+        diagnostico_download["arquivos_na_pasta_depois"] = _arquivos_da_pasta(
+            pasta_destino
+        )
+        diagnostico_download["logs"] = download_logger.linhas[-400:]
+        st.session_state["download_diagnostico"] = diagnostico_download
+
     except yt_dlp.utils.DownloadError as exc:
         msg = str(exc)
         low = msg.lower()
+
+        diagnostico_download["resultado"] = "falha"
+        diagnostico_download["erro"] = {
+            "tipo": type(exc).__name__,
+            "mensagem": DiagnosticoLogger._redact(msg),
+            "tem_403": "403" in low or "forbidden" in low,
+        }
+        diagnostico_download["arquivos_na_pasta_depois"] = _arquivos_da_pasta(
+            pasta_destino
+        )
+        diagnostico_download["logs"] = download_logger.linhas[-400:]
+        st.session_state["download_diagnostico"] = diagnostico_download
+
         if "403" in low or "forbidden" in low:
             raise RuntimeError(
-                "O YouTube recusou o stream (HTTP 403). O provider de PO Token foi configurado, "
-                "mas este vídeo/IP pode exigir outra estratégia de acesso."
+                "O YouTube recusou o stream (HTTP 403). "
+                "O download foi interrompido, e o diagnóstico da tentativa real "
+                "foi salvo logo abaixo. Ele agora registra qual formato o yt-dlp "
+                "tentou baixar e em qual etapa ocorreu o 403."
             ) from exc
+
         if "ffmpeg" in low or "ffprobe" in low:
-            raise RuntimeError("FFmpeg/FFprobe não está disponível no servidor.") from exc
-        raise RuntimeError(f"Falha no download: {msg}") from exc
+            raise RuntimeError(
+                "FFmpeg/FFprobe não está disponível no servidor. "
+                "O diagnóstico da tentativa real foi salvo logo abaixo."
+            ) from exc
+
+        raise RuntimeError(
+            f"Falha no download: {msg}"
+        ) from exc
+
     except Exception as exc:
-        raise RuntimeError(f"Erro durante o processamento: {exc}") from exc
+        diagnostico_download["resultado"] = "falha"
+        diagnostico_download["erro"] = {
+            "tipo": type(exc).__name__,
+            "mensagem": DiagnosticoLogger._redact(str(exc)),
+        }
+        diagnostico_download["arquivos_na_pasta_depois"] = _arquivos_da_pasta(
+            pasta_destino
+        )
+        diagnostico_download["logs"] = download_logger.linhas[-400:]
+        st.session_state["download_diagnostico"] = diagnostico_download
+
+        raise RuntimeError(
+            f"Erro durante o processamento: {exc}"
+        ) from exc
 
     return _arquivo_final(pasta_destino, extensao_final)
 
@@ -1062,7 +1157,7 @@ def mostrar_metadados(info: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.title("🎬 YouTube Downloader — Diagnóstico Completo V7")
+    st.title("🎬 YouTube Downloader — Diagnóstico Completo V9")
     st.caption("MP4 com áudio ou extração de áudio MP3 — processamento realizado no servidor.")
     st.info("Use somente conteúdo que você tenha autorização para baixar ou que seja permitido pelos termos e direitos aplicáveis.")
 
@@ -1118,6 +1213,7 @@ def main() -> None:
                     info = extrair_info_video(url)
                     st.session_state["video_info"] = info
                     st.session_state["video_url"] = normalizar_url(url)
+                    st.session_state.pop("download_diagnostico", None)
                 except Exception as exc:
                     st.error(str(exc))
 
@@ -1196,6 +1292,45 @@ def main() -> None:
                 "📄 Baixar diagnóstico completo (JSON)",
                 data=diagnostico_json.encode("utf-8"),
                 file_name="diagnostico_yt_dlp_bgutil.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+    download_diag = st.session_state.get("download_diagnostico")
+    if download_diag:
+        with st.expander("🧪 Diagnóstico da última tentativa REAL de download", expanded=True):
+            st.warning(
+                "Este diagnóstico é diferente do botão 'Diagnóstico': "
+                "ele foi capturado durante uma tentativa real de baixar o arquivo."
+            )
+            st.json({
+                "resultado": download_diag.get("resultado"),
+                "erro": download_diag.get("erro"),
+                "tipo": download_diag.get("tipo"),
+                "qualidade_solicitada": download_diag.get("qualidade_solicitada"),
+                "format_selector": download_diag.get("format_selector"),
+                "merge_output_format": download_diag.get("merge_output_format"),
+                "extractor_args": download_diag.get("extractor_args"),
+                "js_runtimes": download_diag.get("js_runtimes"),
+                "arquivos_na_pasta_antes": download_diag.get("arquivos_na_pasta_antes"),
+                "arquivos_na_pasta_depois": download_diag.get("arquivos_na_pasta_depois"),
+            })
+            st.subheader("Log real do download")
+            st.code(
+                "\n".join(download_diag.get("logs") or ["Nenhum log capturado."]),
+                language="text",
+            )
+
+            download_diag_json = json.dumps(
+                download_diag,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+            st.download_button(
+                "📄 Baixar diagnóstico da tentativa real (JSON)",
+                data=download_diag_json.encode("utf-8"),
+                file_name="diagnostico_download_real.json",
                 mime="application/json",
                 use_container_width=True,
             )
