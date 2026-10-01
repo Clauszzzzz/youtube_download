@@ -280,11 +280,50 @@ def obter_formatos_disponiveis(info_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def montar_opcoes_resolucao(alturas: list[int]) -> Dict[str, int]:
-    """Converte alturas reais do YouTube em opções comuns como 1440p/1080p."""
+    """
+    Converte as alturas reais do YouTube em opções comuns.
+
+    A maior resolução real encontrada determina a maior opção exibida.
+    A maior opção disponível recebe a indicação "máxima disponível".
+    Ex.: se o vídeo chega a 720p, o menu mostra 720p (máxima disponível),
+    480p, 360p, 240p e 144p.
+    """
+    alturas_validas = []
+    for altura in alturas:
+        try:
+            altura_int = int(altura)
+            if altura_int > 0:
+                alturas_validas.append(altura_int)
+        except (TypeError, ValueError):
+            continue
+
+    if not alturas_validas:
+        return {}
+
+    maior_altura = max(alturas_validas)
+
+    # Escolhe apenas as resoluções padrão que realmente podem ser
+    # obtidas sem ultrapassar a resolução máxima do vídeo.
+    disponiveis = [
+        (padrao, label)
+        for padrao, label in RESOLUCOES_PADRAO
+        if maior_altura >= padrao
+    ]
+
+    if not disponiveis:
+        # Caso raro: o vídeo tenha uma altura abaixo de 144p.
+        # Ainda mostramos a altura real para não esconder a única opção.
+        return {f"{maior_altura}p (máxima disponível)": maior_altura}
+
+    maior_padrao = disponiveis[0][0]
     opcoes: Dict[str, int] = {}
-    for padrao, label in RESOLUCOES_PADRAO:
-        if any(altura >= padrao for altura in alturas):
+
+    for padrao, label in disponiveis:
+        if padrao == maior_padrao:
+            opcoes[f"{label} (máxima disponível)"] = padrao
+        else:
             opcoes[label] = padrao
+
     return opcoes
 
 
@@ -477,9 +516,11 @@ def main() -> None:
         escolha = st.selectbox("Qualidade", list(opcoes.keys()))
         qualidade = opcoes[escolha]
         formato = "video"
+        maior_opcao = next(iter(opcoes))
         st.caption(
-            "As opções usam resoluções padrão. O servidor procura o melhor vídeo disponível "
-            f"até {escolha} e combina com o melhor áudio usando FFmpeg."
+            f"Máxima disponível neste vídeo: **{maior_opcao}**. "
+            f"O servidor procura o melhor vídeo até a resolução escolhida "
+            "e combina com o melhor áudio usando FFmpeg."
         )
     else:
         opcoes = {
