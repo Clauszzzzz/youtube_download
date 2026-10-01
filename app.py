@@ -1194,7 +1194,7 @@ def baixar_e_converter(
         tentativa["ordem"] = indice
         diagnostico_download["tentativas"].append(tentativa)
 
-        if tentativa.get("resultado", {}).get("status") == "concluido":
+        if isinstance(tentativa.get("resultado"), dict) and tentativa["resultado"].get("status") == "concluido":
             diagnostico_download["resultado"] = {
                 "status": "concluido",
                 "returncode": tentativa["resultado"].get("returncode"),
@@ -1216,7 +1216,7 @@ def baixar_e_converter(
         )
 
     tem_403 = any(
-        (t.get("erro") or {}).get("tem_403")
+        isinstance(t.get("erro"), dict) and t["erro"].get("tem_403")
         for t in diagnostico_download["tentativas"]
     )
 
