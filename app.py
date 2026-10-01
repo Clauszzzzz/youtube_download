@@ -103,8 +103,8 @@ def _extrair_provider() -> None:
     """Baixa e prepara o BgUtils para o modo script (sem servidor HTTP)."""
     BGUTIL_DIR.mkdir(parents=True, exist_ok=True)
 
-    script = BGUTIL_SERVER / "src" / "generate_once.ts"
-    if not script.exists():
+    script = BGUTIL_SERVER / "build" / "generate_once.js"
+    if not (BGUTIL_SERVER / "src" / "generate_once.ts").exists():
         url = (
             "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/"
             f"archive/refs/tags/{BGUTIL_VERSION}.tar.gz"
@@ -155,7 +155,32 @@ def _extrair_provider() -> None:
             )
 
     if not script.exists():
-        raise RuntimeError(f"O script do BgUtils não foi encontrado: {script}")
+        # O modo script do BgUtils exige o JavaScript transpilado em build/.
+        # Deno consegue executar o tsc do npm sem instalar Node.js no servidor.
+        resultado = subprocess.run(
+            [
+                deno,
+                "x",
+                "-p",
+                "typescript@6.0.3",
+                "tsc",
+                "--project",
+                "tsconfig.json",
+            ],
+            cwd=BGUTIL_SERVER,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300,
+        )
+        if resultado.returncode != 0:
+            raise RuntimeError(
+                "Falha ao compilar o BgUtils para o modo script.\n\n"
+                + resultado.stdout[-6000:]
+            )
+
+    if not script.exists():
+        raise RuntimeError(f"O script compilado do BgUtils não foi encontrado: {script}")
 
     return None
 
@@ -165,7 +190,7 @@ def preparar_ambiente() -> Dict[str, str]:
     """Prepara Deno/BgUtils uma única vez por instância do Streamlit."""
     _extrair_provider()
     deno = shutil.which("deno")
-    script = BGUTIL_SERVER / "src" / "generate_once.ts"
+    script = BGUTIL_SERVER / "build" / "generate_once.js"
     return {"deno": deno or "", "script": str(script)}
 
 
@@ -173,7 +198,7 @@ def _opcoes_provider() -> Dict[str, Dict[str, str]]:
     ambiente = preparar_ambiente()
     return {
         "youtubepot-bgutilscript": {
-            "script_path": ambiente["script"],
+            "server_home": str(Path(ambiente["script"]).parent.parent),
         }
     }
 
@@ -182,6 +207,9 @@ def _opcoes_js() -> Dict[str, Any]:
     return {
         "js_runtimes": {"deno": {}},
         "remote_components": {"ejs": ["github"]},
+        "extractor_args": {
+            "youtube": {"player_client": ["mweb"]},
+        },
     }
 
 
@@ -198,7 +226,10 @@ def extrair_info_video(url: str) -> Dict[str, Any]:
         "retries": 2,
         "fragment_retries": 2,
         **_opcoes_js(),
-        "extractor_args": _opcoes_provider(),
+        "extractor_args": {
+            **_opcoes_js().get("extractor_args", {}),
+            **_opcoes_provider(),
+        },
     }
 
     try:
@@ -323,7 +354,10 @@ def baixar_e_converter(
         "progress_hooks": [progress.hook] if progress else [],
         "outtmpl": str(Path(pasta_destino) / "%(title).180s.%(ext)s"),
         **_opcoes_js(),
-        "extractor_args": _opcoes_provider(),
+        "extractor_args": {
+            **_opcoes_js().get("extractor_args", {}),
+            **_opcoes_provider(),
+        },
     }
 
     if formato_escolhido == "video":
