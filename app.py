@@ -1157,7 +1157,7 @@ def mostrar_metadados(info: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.title("🎬 YouTube Downloader — Diagnóstico Completo V9")
+    st.title("🎬 YouTube Downloader — Diagnóstico Completo V10")
     st.caption("MP4 com áudio ou extração de áudio MP3 — processamento realizado no servidor.")
     st.info("Use somente conteúdo que você tenha autorização para baixar ou que seja permitido pelos termos e direitos aplicáveis.")
 
@@ -1214,6 +1214,7 @@ def main() -> None:
                     st.session_state["video_info"] = info
                     st.session_state["video_url"] = normalizar_url(url)
                     st.session_state.pop("download_diagnostico", None)
+                    st.session_state.pop("download_error", None)
                 except Exception as exc:
                     st.error(str(exc))
 
@@ -1295,6 +1296,10 @@ def main() -> None:
                 mime="application/json",
                 use_container_width=True,
             )
+
+    download_error = st.session_state.get("download_error")
+    if download_error:
+        st.error(download_error)
 
     download_diag = st.session_state.get("download_diagnostico")
     if download_diag:
@@ -1417,7 +1422,12 @@ def main() -> None:
                     use_container_width=True,
                 )
         except Exception as exc:
-            st.error(str(exc))
+            # O painel de diagnóstico é renderizado antes do botão de download.
+            # Como o clique provoca apenas esta execução do script, precisamos
+            # persistir o erro e forçar uma nova execução para que o diagnóstico
+            # recém-gerado apareça na tela.
+            st.session_state["download_error"] = str(exc)
+            st.rerun()
 
 
 if __name__ == "__main__":
