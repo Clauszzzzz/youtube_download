@@ -8,11 +8,12 @@ import tempfile
 import traceback
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse, parse_qs
 
 import streamlit as st
 import yt_dlp
 
-st.set_page_config(page_title='YouTube Downloader — Diagnóstico V16', page_icon='🎬', layout='wide')
+st.set_page_config(page_title='YouTube Downloader — Diagnóstico V17', page_icon='🎬', layout='wide')
 
 CLIENTES = ['web_embedded', 'android', 'android_vr']
 RESOLUCOES = [2160, 1440, 1080, 720, 480, 360, 240, 144]
@@ -20,7 +21,28 @@ MAX_BYTES = 500 * 1024 * 1024
 
 
 def redigir(texto: str) -> str:
+    """Redige segredos e reduz URLs assinadas do GoogleVideo sem perder pistas úteis."""
     texto = str(texto)
+
+    # URLs assinadas do GoogleVideo podem conter sig, spc, n, expiração etc.
+    # Para o JSON que o usuário enviará ao diagnóstico, preservamos apenas
+    # host/path e alguns parâmetros úteis para investigação (ip, itag, c, mime).
+    def sanitize_googlevideo(match):
+        raw = match.group(0)
+        try:
+            u = urlparse(raw)
+            q = parse_qs(u.query)
+            keep = {}
+            for key in ('ip', 'itag', 'c', 'mime'):
+                if key in q and q[key]:
+                    keep[key] = q[key][0]
+            query = '&'.join(f'{k}={v}' for k, v in keep.items())
+            return f'{u.scheme}://{u.netloc}{u.path}' + (f'?{query}' if query else '?[PARAMETROS_OCULTOS]')
+        except Exception:
+            return '[URL_GOOGLEVIDEO_OCULTA]'
+
+    texto = re.sub(r'https?://[^\s"\']*googlevideo\.com[^\s"\']*', sanitize_googlevideo, texto, flags=re.I)
+
     patterns = [
         (r'(?i)(authorization\s*[:=]\s*)\S+', r'\1[OCULTO]'),
         (r'(?i)(cookie\s*[:=]\s*)\S+', r'\1[OCULTO]'),
@@ -30,7 +52,32 @@ def redigir(texto: str) -> str:
     ]
     for pattern, repl in patterns:
         texto = re.sub(pattern, repl, texto)
-    return texto[-16000:]
+    return texto[-20000:]
+
+
+def download_url_network_hints(logs: list[str]) -> dict[str, Any]:
+    """Extrai somente pistas seguras sobre a URL de mídia para o diagnóstico."""
+    joined = '\n'.join(logs)
+    m = re.search(r'https?://[^\s"\']*googlevideo\.com[^\s"\']*', joined, flags=re.I)
+    if not m:
+        return {'googlevideo_url_found': False}
+    raw = m.group(0)
+    try:
+        u = urlparse(raw)
+        q = parse_qs(u.query)
+        ip = q.get('ip', [None])[0]
+        family = 'IPv6' if ip and ':' in ip else ('IPv4' if ip else 'desconhecida')
+        return {
+            'googlevideo_url_found': True,
+            'host': u.netloc,
+            'ip_parameter_present': bool(ip),
+            'ip_family_in_url': family,
+            'ip_parameter': ip,
+            'itag': q.get('itag', [None])[0],
+            'client_parameter_c': q.get('c', [None])[0],
+        }
+    except Exception as e:
+        return {'googlevideo_url_found': True, 'parse_error': f'{type(e).__name__}: {e}'}
 
 
 def run_cmd(cmd: list[str], timeout: int = 20) -> dict[str, Any]:
@@ -59,6 +106,8 @@ def yt_opts(cliente: str, download: bool = False, **extra: Any) -> dict[str, Any
         'retries': 2,
         'fragment_retries': 2,
         'js_runtimes': env['js_runtimes'],
+        # Teste controlado: --force-ipv4 equivale a source_address=0.0.0.0.
+        'source_address': '0.0.0.0',
         'extractor_args': {'youtube': {'player_client': [cliente]}},
         **extra,
     }
@@ -180,14 +229,34 @@ def download_one(url: str, cliente: str, media: str, quality: int, folder: str, 
         result['status'] = 'OK' if rc == 0 else f'RETORNO_{rc}'
     except Exception as e:
         result['error'] = {'type': type(e).__name__, 'message': redigir(str(e)), 'is_403': '403' in str(e) or 'Forbidden' in str(e)}
-    result['logs'] = logs[-350:]
+    result['logs'] = logs[-500:]
+    result['network_hints'] = download_url_network_hints(result['logs'])
     result['extension'] = ext
     return result
 
 
+def build_export_payload() -> dict[str, Any]:
+    return {
+        'app': 'V17',
+        'purpose': 'diagnostico_download',
+        'yt_dlp': yt_dlp.version.__version__,
+        'python': platform.python_version(),
+        'platform': platform.platform(),
+        'force_ipv4': True,
+        'source_address': '0.0.0.0',
+        'url': st.session_state.get('url'),
+        'selected_client': st.session_state.get('selected_client'),
+        'client_results': st.session_state.get('client_results', []),
+        'last_download': st.session_state.get('last_download'),
+        'notes': {
+            'googlevideo_urls': 'URLs assinadas são sanitizadas; somente host e parâmetros úteis como ip/itag/c/mime são preservados.',
+            'credentials': 'Nenhuma senha, cookie ou token deliberado deve ser incluído no export.',
+        },
+    }
+
 def main():
-    st.title('🎬 YouTube Downloader — Diagnóstico Completo V16')
-    st.caption('Versão limpa: sem BgUtils na inicialização. O objetivo é separar cliente, formatos e HTTP 403.')
+    st.title('🎬 YouTube Downloader — Diagnóstico Completo V17')
+    st.caption('Teste controlado: web_embedded/android/android_vr + IPv4 forçado + exportação JSON do diagnóstico.')
     st.info('Use somente conteúdo que você tenha autorização para baixar ou que seja permitido pelos termos e direitos aplicáveis.')
 
     with st.expander('Ambiente', expanded=False):
@@ -255,14 +324,16 @@ def main():
 
         if diag_btn:
             payload = {
-                'app': 'V16 clean',
+                'app': 'V17',
+                'force_ipv4': True,
+                'source_address': '0.0.0.0',
                 'yt_dlp': yt_dlp.version.__version__,
                 'python': platform.python_version(),
                 'platform': platform.platform(),
                 'url': normalize_url(url),
                 'results': results,
             }
-            st.download_button('📄 Baixar diagnóstico JSON', json.dumps(payload, ensure_ascii=False, indent=2).encode(), 'diagnostico_v16.json', 'application/json', use_container_width=True)
+            st.download_button('📄 Baixar diagnóstico JSON', json.dumps(payload, ensure_ascii=False, indent=2).encode(), 'diagnostico_v17.json', 'application/json', use_container_width=True)
 
     info = st.session_state.get('video_info')
     if not info:
@@ -325,6 +396,22 @@ def main():
                 with st.expander('Log real do download', expanded=True):
                     st.json({k: v for k, v in result.items() if k != 'logs'})
                     st.code('\n'.join(result.get('logs') or ['Sem logs.']), language='text')
+
+    # Exportação separada do último download: este é o arquivo recomendado
+    # para o usuário anexar no chat quando precisarmos analisar um 403.
+    if st.session_state.get('last_download'):
+        st.divider()
+        st.subheader('📦 Enviar diagnóstico ao ChatGPT')
+        st.caption('Baixe este JSON e anexe-o na conversa. Ele contém o log do download e as informações técnicas necessárias, com URLs assinadas sanitizadas.')
+        export = build_export_payload()
+        st.download_button(
+            '📄 Baixar JSON do log do download',
+            json.dumps(export, ensure_ascii=False, indent=2).encode('utf-8'),
+            'log_download_v17.json',
+            'application/json',
+            use_container_width=True,
+            key='download_log_json_v17',
+        )
 
 if __name__ == '__main__':
     main()
