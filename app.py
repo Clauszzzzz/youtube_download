@@ -198,7 +198,7 @@ def _opcoes_provider() -> Dict[str, Dict[str, str]]:
     ambiente = preparar_ambiente()
     return {
         "youtubepot-bgutilscript": {
-            "server_home": str(Path(ambiente["script"]).parent.parent),
+            "script_path": ambiente["script"],
         }
     }
 
@@ -208,9 +208,110 @@ def _opcoes_js() -> Dict[str, Any]:
         "js_runtimes": {"deno": {}},
         "remote_components": {"ejs": ["github"]},
         "extractor_args": {
-            "youtube": {"player_client": ["mweb", "web_creator", "web_safari"]},
+            "youtube": {"player_client": ["mweb", "default"]},
         },
     }
+
+
+class DiagnosticoLogger:
+    """Captura logs do yt-dlp para verificar provider/PO Token sem expor tokens."""
+
+    def __init__(self) -> None:
+        self.linhas: list[str] = []
+
+    def _guardar(self, mensagem: Any) -> None:
+        texto = str(mensagem)
+        # Não exibimos valores que possam ser tokens, cookies ou URLs enormes.
+        texto = re.sub(r"(?i)(po.?token[^=:\n]*[=:]\s*)[^\s,;]+", r"\1[OCULTO]", texto)
+        if len(texto) > 1800:
+            texto = texto[:1800] + " …"
+        self.linhas.append(texto)
+
+    def debug(self, msg: str) -> None:
+        self._guardar(msg)
+
+    def info(self, msg: str) -> None:
+        self._guardar(msg)
+
+    def warning(self, msg: str) -> None:
+        self._guardar("WARNING: " + msg)
+
+    def error(self, msg: str) -> None:
+        self._guardar("ERROR: " + msg)
+
+
+def _resumo_diagnostico(info: Dict[str, Any], logger: DiagnosticoLogger, ambiente: Dict[str, str]) -> Dict[str, Any]:
+    linhas_provider = []
+    linhas_pot = []
+    linhas_sabr = []
+    for linha in logger.linhas:
+        low = linha.lower()
+        if "po token providers" in low or "pot:bgutil" in low or "pot]" in low:
+            linhas_pot.append(linha)
+        if "sabr" in low or "missing a url" in low:
+            linhas_sabr.append(linha)
+        if "plugin director" in low or "loaded " in low and "extractor" in low:
+            linhas_provider.append(linha)
+
+    formatos = []
+    for fmt in info.get("formats", []):
+        if fmt.get("vcodec") not in (None, "none"):
+            formatos.append({
+                "id": fmt.get("format_id"),
+                "height": fmt.get("height"),
+                "width": fmt.get("width"),
+                "ext": fmt.get("ext"),
+                "vcodec": fmt.get("vcodec"),
+                "acodec": fmt.get("acodec"),
+                "protocol": fmt.get("protocol"),
+                "has_url": bool(fmt.get("url")),
+            })
+
+    return {
+        "yt_dlp": getattr(yt_dlp.version, "__version__", "desconhecida"),
+        "python": __import__("sys").version.split()[0],
+        "deno": ambiente.get("deno") or "não encontrado",
+        "script": ambiente.get("script") or "não definido",
+        "script_existe": Path(ambiente.get("script", "")).is_file(),
+        "plugin_dirs": [str(p) for p in yt_dlp.plugins.directories()],
+        "pot_logs": linhas_pot[-40:],
+        "provider_logs": linhas_provider[-20:],
+        "sabr_logs": linhas_sabr[-20:],
+        "formatos": formatos,
+    }
+
+
+def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    if not url or not url.strip():
+        raise ValueError("Informe uma URL do YouTube.")
+
+    ambiente = preparar_ambiente()
+    logger = DiagnosticoLogger()
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": False,
+        "verbose": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "socket_timeout": 30,
+        "retries": 2,
+        "fragment_retries": 2,
+        "logger": logger,
+        **_opcoes_js(),
+        "extractor_args": {
+            **_opcoes_js().get("extractor_args", {}),
+            "youtube": {
+                **_opcoes_js().get("extractor_args", {}).get("youtube", {}),
+                "pot_trace": ["true"],
+            },
+            **_opcoes_provider(),
+        },
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(normalizar_url(url), download=False)
+
+    return info, _resumo_diagnostico(info, logger, ambiente)
 
 
 def extrair_info_video(url: str) -> Dict[str, Any]:
@@ -253,10 +354,7 @@ def extrair_info_video(url: str) -> Dict[str, Any]:
 
 
 def obter_formatos_disponiveis(info_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Detecta todas as streams de vídeo, não apenas MP4.
-
-    O YouTube pode entregar 1440p/2160p em WebM/VP9/AV1.
-    """
+    """Detecta todas as streams de vídeo, sem limitar o container a MP4."""
     alturas = set()
     videos = []
     audios = []
@@ -286,10 +384,25 @@ def obter_formatos_disponiveis(info_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def montar_opcoes_resolucao(alturas: list[int]) -> Dict[str, int]:
-    """Converte alturas reais do YouTube em opções comuns como 1440p/1080p."""
+    """Mostra somente resoluções padrão realmente alcançáveis pelo vídeo."""
+    if not alturas:
+        return {}
+
+    maior = max(alturas)
+    disponiveis = [
+        (padrao, label)
+        for padrao, label in RESOLUCOES_PADRAO
+        if maior >= padrao
+    ]
+
+    if not disponiveis:
+        return {f"{maior}p (máxima disponível)": maior}
+
     opcoes: Dict[str, int] = {}
-    for padrao, label in RESOLUCOES_PADRAO:
-        if any(altura >= padrao for altura in alturas):
+    for indice, (padrao, label) in enumerate(disponiveis):
+        if indice == 0:
+            opcoes[f"{label} (máxima disponível)"] = padrao
+        else:
             opcoes[label] = padrao
     return opcoes
 
@@ -444,7 +557,28 @@ def main() -> None:
 
     url = st.text_input("URL do YouTube", placeholder="https://www.youtube.com/watch?v=...")
 
-    if st.button("🔎 Analisar Vídeo", type="primary", use_container_width=True):
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        analisar = st.button("🔎 Analisar Vídeo", type="primary", use_container_width=True)
+    with col2:
+        diagnostico = st.button("🧪 Diagnóstico", use_container_width=True)
+
+    if diagnostico:
+        if not url.strip():
+            st.warning("Cole uma URL antes de executar o diagnóstico.")
+        elif not ambiente_ok:
+            st.error("Corrija primeiro o problema mostrado no diagnóstico do servidor.")
+        else:
+            with st.spinner("Executando diagnóstico completo do yt-dlp + PO Token... "):
+                try:
+                    info_diag, diag = diagnosticar_video(url)
+                    st.session_state["diagnostico"] = diag
+                    st.session_state["video_info"] = info_diag
+                    st.session_state["video_url"] = normalizar_url(url)
+                except Exception as exc:
+                    st.session_state["diagnostico"] = {"erro": str(exc)}
+
+    if analisar:
         if not url.strip():
             st.warning("Cole uma URL antes de continuar.")
         elif not ambiente_ok:
@@ -457,6 +591,34 @@ def main() -> None:
                     st.session_state["video_url"] = normalizar_url(url)
                 except Exception as exc:
                     st.error(str(exc))
+
+    diag = st.session_state.get("diagnostico")
+    if diag:
+        with st.expander("🧪 Diagnóstico técnico", expanded=True):
+            if diag.get("erro"):
+                st.error(diag["erro"])
+            else:
+                st.write(f"**yt-dlp:** `{diag.get('yt_dlp')}`")
+                st.write(f"**Python:** `{diag.get('python')}`")
+                st.write(f"**Deno:** `{diag.get('deno')}`")
+                st.write(f"**BgUtils script:** `{diag.get('script')}`")
+                st.write(f"**generate_once.js existe:** `{diag.get('script_existe')}`")
+                st.write("**Diretórios de plugins detectados:**")
+                st.code("\n".join(diag.get("plugin_dirs") or ["nenhum detectado"]))
+
+                st.write("**Logs de PO Token / BgUtils:**")
+                st.code("\n".join(diag.get("pot_logs") or ["Nenhuma linha de PO Token foi registrada."]))
+
+                if diag.get("sabr_logs"):
+                    st.write("**Avisos relacionados a SABR:**")
+                    st.code("\n".join(diag["sabr_logs"]))
+
+                st.write("**Formatos de vídeo realmente retornados pelo yt-dlp:**")
+                formatos_diag = diag.get("formatos") or []
+                if formatos_diag:
+                    st.dataframe(formatos_diag, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("O yt-dlp não retornou nenhuma stream de vídeo.")
 
     info = st.session_state.get("video_info")
     if not info:
@@ -478,7 +640,7 @@ def main() -> None:
     if tipo == "Vídeo MP4 (Com Áudio)":
         opcoes = montar_opcoes_resolucao(formatos["alturas"])
         if not opcoes:
-            st.warning("Nenhum stream de vídeo MP4 compatível foi encontrado.")
+            st.warning("Nenhum stream de vídeo compatível foi encontrado.")
             return
 
         escolha = st.selectbox("Qualidade", list(opcoes.keys()))
