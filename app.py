@@ -823,7 +823,6 @@ def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "fragment_retries": 2,
         "logger": logger,
         "js_runtimes": op_js["js_runtimes"],
-        "remote_components": op_js["remote_components"],
         "extractor_args": extractor_args,
     }
 
