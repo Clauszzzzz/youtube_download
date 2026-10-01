@@ -1,3 +1,4 @@
-yt-dlp[default] @ https://github.com/yt-dlp/yt-dlp/archive/c7fb478.tar.gz
+--pre
+yt-dlp[default]==2026.09.27.232945
 streamlit
 deno==2.9.7
