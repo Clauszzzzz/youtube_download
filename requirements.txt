@@ -1,4 +1,7 @@
+# V15: usa o nightly do yt-dlp porque o nightly de 2026-09-16 contém
+# correção recente do cliente web_embedded e houve relatos de workaround
+# com player_client=android para os 403 atuais do YouTube.
+yt-dlp[default] @ https://github.com/yt-dlp/yt-dlp/archive/c7fb478.tar.gz
 streamlit
-yt-dlp[default]
 deno==2.9.7
 bgutil-ytdlp-pot-provider==2.0.0
