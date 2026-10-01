@@ -307,16 +307,17 @@ def preparar_ambiente() -> Dict[str, Any]:
     }
 
 
-def _opcoes_provider() -> Dict[str, Dict[str, str]]:
+def _opcoes_provider() -> Dict[str, Dict[str, Any]]:
     preparar_ambiente()
-    # O modo HTTP é preferível aqui porque o próprio plugin conversa com o
-    # servidor local. Isso elimina a etapa em que o modo script aparecia como
-    # "external, unavailable" no diagnóstico anterior.
-    return {
-        "youtubepot-bgutilhttp": {
-            "base_url": BGUTIL_HTTP_URL,
-        }
-    }
+    # O servidor está exatamente no endereço padrão do BgUtils (127.0.0.1:4416).
+    # Nesse caso, o plugin não precisa receber base_url: o próprio yt-dlp
+    # descobre/usará o endereço padrão. Isso também evita a conversão incorreta
+    # de uma string Python em argumento de extractor_args (que no diagnóstico
+    # anterior acabou chegando como "h/ping").
+    #
+    # Importante: não configuramos o modo script aqui. Com o servidor HTTP ativo,
+    # o BgUtils informa o provider HTTP e ele é priorizado pelo plugin.
+    return {}
 
 
 def _opcoes_js() -> Dict[str, Any]:
