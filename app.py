@@ -543,14 +543,16 @@ def _testar_pot_direto(ambiente: Dict[str, str], video_id: str) -> Dict[str, Any
     server_home = BGUTIL_SERVER.resolve()
     node_modules = (server_home / "node_modules").resolve()
 
-    # Permissões absolutas: o generate_once.ts usa o cache em ~/.cache,
-    # node_modules via FFI e pode consultar informações do sistema.
+    # O generate_once.ts usa a pasta de cache em ~/.cache/bgutil-ytdlp-pot-provider
+    # (BGUTIL_DIR), não apenas server/. Ele também grava nessa pasta.
+    # Portanto, leitura e escrita precisam abranger BGUTIL_DIR.
     cmd = [
         deno, "run", "--no-prompt",
         "--allow-env",
         "--allow-net",
         f"--allow-ffi={node_modules}",
-        f"--allow-read={server_home}",
+        f"--allow-read={BGUTIL_DIR.resolve()}",
+        f"--allow-write={BGUTIL_DIR.resolve()}",
         "--allow-sys",
         str(script_path),
         "--content-binding", video_id,
@@ -601,7 +603,8 @@ def _testar_script_version(ambiente: Dict[str, str]) -> Dict[str, Any]:
         deno, "run", "--no-prompt",
         "--allow-env", "--allow-net",
         f"--allow-ffi={node_modules}",
-        f"--allow-read={server_home}",
+        f"--allow-read={BGUTIL_DIR.resolve()}",
+        f"--allow-write={BGUTIL_DIR.resolve()}",
         "--allow-sys",
         str(Path(script).resolve()),
         "--version",
