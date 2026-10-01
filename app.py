@@ -827,7 +827,7 @@ def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     }
 
     config = {
-        "js_runtimes": op_js.get("js_runtimes"),
+        "js_runtimes": estrategia.get("js_runtimes"),
         "extractor_args": extractor_args,
     }
 
@@ -1018,10 +1018,19 @@ def _opcoes_download_por_cliente(
 ) -> Dict[str, Any]:
     """Monta uma estratégia de download isolada por cliente do YouTube.
 
-    A ordem foi escolhida para testar primeiro caminhos que podem evitar o
-    GVS HTTPS que está retornando 403 no mweb deste ambiente.
+    A estratégia é escolhida por cliente. Em V13, o cliente web_safari é
+    usado isoladamente para testar HLS sem depender do fluxo mweb/PO Token.
     """
-    op_js = _opcoes_js()
+    if cliente == "web_safari":
+        # V13: não inicializar o BgUtils para o experimento web_safari.
+        # O cliente será testado de forma independente; Deno continua disponível
+        # apenas como runtime JS para o yt-dlp, se ele precisar resolver desafios.
+        deno = shutil.which("deno")
+        if not deno:
+            raise RuntimeError("Deno não foi encontrado no servidor.")
+        op_js = {"js_runtimes": {"deno": {"path": deno}}}
+    else:
+        op_js = _opcoes_js()
 
     if formato_escolhido == "video":
         if cliente == "web_safari":
@@ -1059,8 +1068,12 @@ def _opcoes_download_por_cliente(
         "youtube": {
             "player_client": [cliente],
         },
-        **_opcoes_provider(),
     }
+    # O teste V13 de web_safari precisa ser realmente independente do BgUtils.
+    # Para mweb, preservamos a possibilidade de usar o provider explícito em
+    # testes futuros; para web_safari, não há motivo para inicializar o provider.
+    if cliente != "web_safari":
+        extractor_args.update(_opcoes_provider())
 
     return {
         "cliente": cliente,
@@ -1079,7 +1092,6 @@ def _download_uma_estrategia(
 ) -> Dict[str, Any]:
     """Executa uma tentativa isolada e devolve diagnóstico sem interromper o fallback."""
     logger = DownloadDiagnosticoLogger()
-    op_js = _opcoes_js()
 
     common = {
         "noplaylist": True,
@@ -1155,30 +1167,26 @@ def baixar_e_converter(
 
     url_normalizada = normalizar_url(url)
 
-    # V12 é um teste controlado: corrigimos primeiro a integração do BgUtils
-    # sem trocar simultaneamente o cliente do YouTube. Assim, se funcionar,
-    # sabemos que a configuração explícita do provider era relevante; se falhar,
-    # o próximo diagnóstico poderá testar web_safari/android_vr separadamente.
+    # V13 é um experimento isolado: testa apenas o cliente web_safari.
+    # Não configuramos BgUtils/mweb nesta tentativa, para retirar PO Token/GVS
+    # mweb da equação. Se funcionar, sabemos que o caminho HLS/web_safari é
+    # utilizável neste ambiente. Se falhar, o diagnóstico fica limpo para o
+    # próximo teste (por exemplo, android_vr).
     estrategias = [
-        _opcoes_download_por_cliente("mweb", formato_escolhido, qualidade),
+        _opcoes_download_por_cliente("web_safari", formato_escolhido, qualidade),
     ]
 
     diagnostico_download = {
         "url": url_normalizada,
         "tipo": formato_escolhido,
         "qualidade_solicitada": qualidade,
-        "tentativa": "download_real_v12_bgutil_script_explicito",
+        "tentativa": "download_real_v13_web_safari",
         "resultado": "falha",
         "cliente_sucesso": None,
         "tentativas": [],
-        "configuracao_bgutil": {
-            "modo": "script",
-            "server_home": str(BGUTIL_SERVER),
-            "script_path": str(BGUTIL_SERVER / "build" / "generate_once.js"),
-        },
         "observacao": (
-            "Teste controlado do mweb com BgUtils em modo script configurado "
-            "explicitamente. Não foram trocados simultaneamente outros clientes."
+            "Teste isolado do cliente web_safari. BgUtils e mweb não são "
+            "configurados nesta tentativa, para testar o caminho HLS sem PO Token."
         ),
     }
 
@@ -1248,7 +1256,7 @@ def mostrar_metadados(info: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.title("🎬 YouTube Downloader — Diagnóstico Completo V12")
+    st.title("🎬 YouTube Downloader — Diagnóstico Completo V13")
     st.caption("MP4 com áudio ou extração de áudio MP3 — processamento realizado no servidor.")
     st.info("Use somente conteúdo que você tenha autorização para baixar ou que seja permitido pelos termos e direitos aplicáveis.")
 
