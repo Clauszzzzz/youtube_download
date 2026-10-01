@@ -208,7 +208,7 @@ def _opcoes_js() -> Dict[str, Any]:
         "js_runtimes": {"deno": {}},
         "remote_components": {"ejs": ["github"]},
         "extractor_args": {
-            "youtube": {"player_client": ["mweb"]},
+            "youtube": {"player_client": ["mweb", "web_creator", "web_safari"]},
         },
     }
 
@@ -253,22 +253,28 @@ def extrair_info_video(url: str) -> Dict[str, Any]:
 
 
 def obter_formatos_disponiveis(info_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Detecta todas as streams de vídeo, não apenas MP4.
+
+    O YouTube pode entregar 1440p/2160p em WebM/VP9/AV1.
+    """
     alturas = set()
     videos = []
     audios = []
 
     for fmt in info_dict.get("formats", []):
-        ext = fmt.get("ext")
         height = fmt.get("height")
         vcodec = fmt.get("vcodec")
         acodec = fmt.get("acodec")
 
-        if ext == "mp4" and vcodec not in (None, "none") and height:
+        if vcodec not in (None, "none") and height:
             try:
-                alturas.add(int(height))
-                videos.append(fmt)
+                altura = int(height)
+                if altura > 0:
+                    alturas.add(altura)
+                    videos.append(fmt)
             except (TypeError, ValueError):
                 pass
+
         if acodec not in (None, "none") and vcodec in (None, "none"):
             audios.append(fmt)
 
@@ -280,50 +286,11 @@ def obter_formatos_disponiveis(info_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def montar_opcoes_resolucao(alturas: list[int]) -> Dict[str, int]:
-    """
-    Converte as alturas reais do YouTube em opções comuns.
-
-    A maior resolução real encontrada determina a maior opção exibida.
-    A maior opção disponível recebe a indicação "máxima disponível".
-    Ex.: se o vídeo chega a 720p, o menu mostra 720p (máxima disponível),
-    480p, 360p, 240p e 144p.
-    """
-    alturas_validas = []
-    for altura in alturas:
-        try:
-            altura_int = int(altura)
-            if altura_int > 0:
-                alturas_validas.append(altura_int)
-        except (TypeError, ValueError):
-            continue
-
-    if not alturas_validas:
-        return {}
-
-    maior_altura = max(alturas_validas)
-
-    # Escolhe apenas as resoluções padrão que realmente podem ser
-    # obtidas sem ultrapassar a resolução máxima do vídeo.
-    disponiveis = [
-        (padrao, label)
-        for padrao, label in RESOLUCOES_PADRAO
-        if maior_altura >= padrao
-    ]
-
-    if not disponiveis:
-        # Caso raro: o vídeo tenha uma altura abaixo de 144p.
-        # Ainda mostramos a altura real para não esconder a única opção.
-        return {f"{maior_altura}p (máxima disponível)": maior_altura}
-
-    maior_padrao = disponiveis[0][0]
+    """Converte alturas reais do YouTube em opções comuns como 1440p/1080p."""
     opcoes: Dict[str, int] = {}
-
-    for padrao, label in disponiveis:
-        if padrao == maior_padrao:
-            opcoes[f"{label} (máxima disponível)"] = padrao
-        else:
+    for padrao, label in RESOLUCOES_PADRAO:
+        if any(altura >= padrao for altura in alturas):
             opcoes[label] = padrao
-
     return opcoes
 
 
@@ -401,10 +368,11 @@ def baixar_e_converter(
 
     if formato_escolhido == "video":
         common.update({
+            # Não restringe a MP4/M4A. Streams de alta resolução do YouTube
+            # podem ser WebM/VP9/AV1 e ainda podem ser processadas pelo FFmpeg.
             "format": (
-                f"bestvideo[height<={qualidade}][ext=mp4]+bestaudio[ext=m4a]/"
                 f"bestvideo[height<={qualidade}]+bestaudio/"
-                f"best[height<={qualidade}]"
+                f"best[height<={qualidade}]/best"
             ),
             "merge_output_format": "mp4",
         })
@@ -516,11 +484,10 @@ def main() -> None:
         escolha = st.selectbox("Qualidade", list(opcoes.keys()))
         qualidade = opcoes[escolha]
         formato = "video"
-        maior_opcao = next(iter(opcoes))
+        maxima = next(iter(opcoes.keys()))
         st.caption(
-            f"Máxima disponível neste vídeo: **{maior_opcao}**. "
-            f"O servidor procura o melhor vídeo até a resolução escolhida "
-            "e combina com o melhor áudio usando FFmpeg."
+            f"Máxima disponível neste vídeo: **{maxima}**. "
+            f"O servidor procura o melhor vídeo até {escolha} e combina com o melhor áudio usando FFmpeg."
         )
     else:
         opcoes = {
