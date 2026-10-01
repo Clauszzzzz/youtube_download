@@ -218,13 +218,13 @@ def preparar_ambiente() -> Dict[str, str]:
 def _opcoes_provider() -> Dict[str, Dict[str, str]]:
     preparar_ambiente()
 
-    # BgUtils 2.x recomenda server_home quando o provider foi instalado fora
-    # do diretório HOME padrão. Não passamos script_path junto: o plugin
-    # calcula build/generate_once.js e src/generate_once.ts a partir do
-    # server_home.
+    # Usamos server_home e script_path explícitos. server_home é a configuração
+    # oficial para instalação fora do HOME; script_path adicionalmente elimina
+    # qualquer ambiguidade na resolução do generate_once.js.
     return {
         "youtubepot-bgutilscript": {
             "server_home": str(BGUTIL_SERVER),
+            "script_path": str(BGUTIL_SERVER / "build" / "generate_once.js"),
         }
     }
 
@@ -466,15 +466,18 @@ def _resumo_diagnostico(info: Dict[str, Any], logger: DiagnosticoLogger, ambient
         # o provider realmente usa. Isso produzia um falso diagnóstico
         # "Requires env access". Agora reproduzimos o modelo documentado para
         # Deno: env + net + ffi em node_modules + leitura de node_modules/cache.
+        server_home = BGUTIL_SERVER.resolve()
+        node_modules = (server_home / "node_modules").resolve()
         deno_base = [
             ambiente["deno"],
             "run",
             "--no-prompt",
             "--allow-env",
             "--allow-net",
-            "--allow-ffi=node_modules",
-            "--allow-read=node_modules,cache",
-            str(script),
+            f"--allow-ffi={node_modules}",
+            f"--allow-read={server_home}",
+            "--allow-sys",
+            str(script.resolve()),
         ]
         comandos["deno_generate_once_version"] = _executar_comando(
             deno_base + ["--version"],
@@ -530,25 +533,31 @@ class DiagnosticoErro(Exception):
 
 
 def _testar_pot_direto(ambiente: Dict[str, str], video_id: str) -> Dict[str, Any]:
-    """Executa o gerador BgUtils diretamente com as permissões reais do Deno."""
+    """Testa o gerador BgUtils diretamente, sem depender do plugin yt-dlp."""
     deno = ambiente.get("deno")
     script = ambiente.get("script")
     if not deno or not script or not video_id:
-        return {"status": "não executado", "motivo": "Deno, script ou video_id ausente"}
+        return {"status": "NAO_EXECUTADO", "motivo": "Deno, script ou video_id ausente"}
 
+    script_path = Path(script).resolve()
+    server_home = BGUTIL_SERVER.resolve()
+    node_modules = (server_home / "node_modules").resolve()
+
+    # Permissões absolutas: o generate_once.ts usa o cache em ~/.cache,
+    # node_modules via FFI e pode consultar informações do sistema.
     cmd = [
         deno, "run", "--no-prompt",
-        "--allow-env", "--allow-net",
-        "--allow-ffi=node_modules",
-        "--allow-read=node_modules,cache",
-        script,
+        "--allow-env",
+        "--allow-net",
+        f"--allow-ffi={node_modules}",
+        f"--allow-read={server_home}",
+        "--allow-sys",
+        str(script_path),
         "--content-binding", video_id,
         "--bypass-cache",
     ]
-    resultado = _executar_comando(cmd, cwd=BGUTIL_SERVER, timeout=90)
-
+    resultado = _executar_comando(cmd, cwd=server_home, timeout=120)
     bruto = resultado.get("saida", "")
-    # Nunca devolve o PO Token bruto.
     texto = DiagnosticoLogger._redact(bruto)
 
     pot = None
@@ -566,10 +575,43 @@ def _testar_pot_direto(ambiente: Dict[str, str], video_id: str) -> Dict[str, Any
         "status": "PO_TOKEN_GERADO" if pot else "FALHA",
         "returncode": resultado.get("returncode"),
         "timeout": resultado.get("timeout"),
+        "deno": deno,
+        "script": str(script_path),
+        "server_home": str(server_home),
+        "script_existe": script_path.is_file(),
+        "node_modules_existe": node_modules.is_dir(),
         "contentBinding": content_binding,
         "expiresAt": expires_at,
         "poToken_presente": bool(pot),
+        "comando_redigido": f"{deno} run ... {script_path} --content-binding [OCULTO] --bypass-cache",
         "saida_redigida": texto[-12000:],
+    }
+
+
+def _testar_script_version(ambiente: Dict[str, str]) -> Dict[str, Any]:
+    """Testa apenas a inicialização do generate_once.js no Deno."""
+    deno = ambiente.get("deno")
+    script = ambiente.get("script")
+    if not deno or not script:
+        return {"status": "NAO_EXECUTADO"}
+
+    server_home = BGUTIL_SERVER.resolve()
+    node_modules = (server_home / "node_modules").resolve()
+    cmd = [
+        deno, "run", "--no-prompt",
+        "--allow-env", "--allow-net",
+        f"--allow-ffi={node_modules}",
+        f"--allow-read={server_home}",
+        "--allow-sys",
+        str(Path(script).resolve()),
+        "--version",
+    ]
+    resultado = _executar_comando(cmd, cwd=server_home, timeout=45)
+    return {
+        "status": "OK" if resultado.get("returncode") == 0 else "FALHA",
+        "returncode": resultado.get("returncode"),
+        "timeout": resultado.get("timeout"),
+        "saida_redigida": DiagnosticoLogger._redact(resultado.get("saida", ""))[-4000:],
     }
 
 
@@ -627,6 +669,7 @@ def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "status": "não executado",
         "motivo": "não foi possível identificar o video_id na URL",
     }
+    script_version = _testar_script_version(ambiente)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -637,11 +680,13 @@ def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         diag["erro_extracao"] = DiagnosticoLogger._redact(traceback.format_exc())
         diag["config_efetiva"] = config
         diag["pot_direto"] = pot_direto
+        diag["script_version_deno"] = script_version
         raise DiagnosticoErro(diag)
 
     diag = _resumo_diagnostico(info, logger, ambiente)
     diag["config_efetiva"] = config
     diag["pot_direto"] = pot_direto
+    diag["script_version_deno"] = script_version
     return info, diag
 
 def extrair_info_video(url: str) -> Dict[str, Any]:
