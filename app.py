@@ -308,16 +308,26 @@ def preparar_ambiente() -> Dict[str, Any]:
 
 
 def _opcoes_provider() -> Dict[str, Dict[str, Any]]:
-    preparar_ambiente()
-    # O servidor está exatamente no endereço padrão do BgUtils (127.0.0.1:4416).
-    # Nesse caso, o plugin não precisa receber base_url: o próprio yt-dlp
-    # descobre/usará o endereço padrão. Isso também evita a conversão incorreta
-    # de uma string Python em argumento de extractor_args (que no diagnóstico
-    # anterior acabou chegando como "h/ping").
-    #
-    # Importante: não configuramos o modo script aqui. Com o servidor HTTP ativo,
-    # o BgUtils informa o provider HTTP e ele é priorizado pelo plugin.
-    return {}
+    ambiente = preparar_ambiente()
+    server_home = str(BGUTIL_SERVER)
+    script = str(BGUTIL_SERVER / "build" / "generate_once.js")
+
+    if not Path(server_home).is_dir():
+        raise RuntimeError(f"Pasta do BgUtils não encontrada: {server_home}")
+    if not Path(script).is_file():
+        raise RuntimeError(f"Script generate_once.js não encontrado: {script}")
+
+    # V12: configurar explicitamente o provider em modo script.
+    # O diagnóstico anterior mostrou que o plugin tentava procurar o script
+    # em ~/bgutil-ytdlp-pot-provider, mas a instalação real está no cache.
+    # A documentação oficial do BgUtils recomenda server_home quando o script
+    # está instalado em um local diferente do padrão.
+    return {
+        "youtubepot-bgutilscript": {
+            "server_home": server_home,
+            "script_path": script,
+        }
+    }
 
 
 def _opcoes_js() -> Dict[str, Any]:
@@ -337,7 +347,6 @@ def _opcoes_js() -> Dict[str, Any]:
         "js_runtimes": {
             "deno": {"path": deno},
         },
-        "remote_components": {"ejs": ["github"]},
         "extractor_args": {
             "youtube": {"player_client": ["mweb", "default"]},
         },
@@ -820,7 +829,6 @@ def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
 
     config = {
         "js_runtimes": op_js.get("js_runtimes"),
-        "remote_components": op_js.get("remote_components"),
         "extractor_args": extractor_args,
     }
 
@@ -1004,6 +1012,138 @@ def _arquivo_final(pasta: str, extensao: str) -> Path:
     return max(candidatos, key=lambda p: p.stat().st_mtime)
 
 
+def _opcoes_download_por_cliente(
+    cliente: str,
+    formato_escolhido: str,
+    qualidade: int,
+) -> Dict[str, Any]:
+    """Monta uma estratégia de download isolada por cliente do YouTube.
+
+    A ordem foi escolhida para testar primeiro caminhos que podem evitar o
+    GVS HTTPS que está retornando 403 no mweb deste ambiente.
+    """
+    op_js = _opcoes_js()
+
+    if formato_escolhido == "video":
+        if cliente == "web_safari":
+            # web_safari pode fornecer HLS pré-muxado (vídeo + áudio), que é
+            # justamente o caminho que queremos testar antes do GVS mweb.
+            seletor = (
+                f"best[protocol^=m3u8][height<={qualidade}]/"
+                f"best[height<={qualidade}]/best"
+            )
+        else:
+            seletor = (
+                f"bestvideo[height<={qualidade}]+bestaudio/"
+                f"best[height<={qualidade}]/best"
+            )
+        extensao_final = ".mp4"
+        extras = {"format": seletor, "merge_output_format": "mp4"}
+    elif formato_escolhido == "audio":
+        if cliente == "web_safari":
+            seletor = "best[protocol^=m3u8]/bestaudio/best"
+        else:
+            seletor = "bestaudio/best"
+        extensao_final = ".mp3"
+        extras = {
+            "format": seletor,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": str(qualidade),
+            }],
+        }
+    else:
+        raise ValueError("Tipo de mídia inválido.")
+
+    extractor_args = {
+        "youtube": {
+            "player_client": [cliente],
+        },
+        **_opcoes_provider(),
+    }
+
+    return {
+        "cliente": cliente,
+        "extractor_args": extractor_args,
+        "extensao_final": extensao_final,
+        **extras,
+        "js_runtimes": op_js.get("js_runtimes"),
+    }
+
+
+def _download_uma_estrategia(
+    url: str,
+    pasta_destino: str,
+    estrategia: Dict[str, Any],
+    progress: Optional[DownloadProgress],
+) -> Dict[str, Any]:
+    """Executa uma tentativa isolada e devolve diagnóstico sem interromper o fallback."""
+    logger = DownloadDiagnosticoLogger()
+    op_js = _opcoes_js()
+
+    common = {
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": False,
+        "verbose": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "concurrent_fragment_downloads": 4,
+        "progress_hooks": [progress.hook] if progress else [],
+        "logger": logger,
+        "outtmpl": str(Path(pasta_destino) / "%(title).180s.%(ext)s"),
+        "js_runtimes": op_js.get("js_runtimes"),
+        "extractor_args": estrategia["extractor_args"],
+        "format": estrategia["format"],
+    }
+
+    if estrategia.get("merge_output_format"):
+        common["merge_output_format"] = estrategia["merge_output_format"]
+    if estrategia.get("postprocessors"):
+        common["postprocessors"] = estrategia["postprocessors"]
+
+    resultado = {
+        "cliente": estrategia["cliente"],
+        "format_selector": estrategia["format"],
+        "extractor_args": estrategia["extractor_args"],
+        "resultado": None,
+        "erro": None,
+        "arquivos_na_pasta_antes": _arquivos_da_pasta(pasta_destino),
+        "arquivos_na_pasta_depois": [],
+        "logs": [],
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(common) as ydl:
+            retorno = ydl.download([url])
+
+        resultado["resultado"] = {
+            "returncode": retorno,
+            "status": "concluido" if retorno == 0 else "retorno_nao_zero",
+        }
+    except yt_dlp.utils.DownloadError as exc:
+        msg = str(exc)
+        resultado["resultado"] = "falha"
+        resultado["erro"] = {
+            "tipo": type(exc).__name__,
+            "mensagem": DiagnosticoLogger._redact(msg),
+            "tem_403": "403" in msg.lower() or "forbidden" in msg.lower(),
+        }
+    except Exception as exc:
+        resultado["resultado"] = "falha"
+        resultado["erro"] = {
+            "tipo": type(exc).__name__,
+            "mensagem": DiagnosticoLogger._redact(str(exc)),
+            "tem_403": "403" in str(exc).lower() or "forbidden" in str(exc).lower(),
+        }
+
+    resultado["arquivos_na_pasta_depois"] = _arquivos_da_pasta(pasta_destino)
+    resultado["logs"] = logger.linhas[-400:]
+    return resultado
+
+
 def baixar_e_converter(
     url: str,
     formato_escolhido: str,
@@ -1014,132 +1154,84 @@ def baixar_e_converter(
     if progress:
         progress.iniciar()
 
-    download_logger = DownloadDiagnosticoLogger()
-
-    common = {
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": False,
-        "verbose": True,
-        "socket_timeout": 30,
-        "retries": 4,
-        "fragment_retries": 4,
-        "concurrent_fragment_downloads": 4,
-        "progress_hooks": [progress.hook] if progress else [],
-        "logger": download_logger,
-        "outtmpl": str(Path(pasta_destino) / "%(title).180s.%(ext)s"),
-        **_opcoes_js(),
-        "extractor_args": {
-            **_opcoes_js().get("extractor_args", {}),
-            **_opcoes_provider(),
-        },
-    }
-
-    if formato_escolhido == "video":
-        common.update({
-            # Mantemos o seletor original, mas o log verbose registra exatamente
-            # quais format_ids o yt-dlp escolheu antes de iniciar cada stream.
-            "format": (
-                f"bestvideo[height<={qualidade}]+bestaudio/"
-                f"best[height<={qualidade}]/best"
-            ),
-            "merge_output_format": "mp4",
-        })
-        extensao_final = ".mp4"
-    elif formato_escolhido == "audio":
-        common.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": str(qualidade),
-            }],
-        })
-        extensao_final = ".mp3"
-    else:
-        raise ValueError("Tipo de mídia inválido.")
-
     url_normalizada = normalizar_url(url)
+
+    # V12 é um teste controlado: corrigimos primeiro a integração do BgUtils
+    # sem trocar simultaneamente o cliente do YouTube. Assim, se funcionar,
+    # sabemos que a configuração explícita do provider era relevante; se falhar,
+    # o próximo diagnóstico poderá testar web_safari/android_vr separadamente.
+    estrategias = [
+        _opcoes_download_por_cliente("mweb", formato_escolhido, qualidade),
+    ]
 
     diagnostico_download = {
         "url": url_normalizada,
         "tipo": formato_escolhido,
         "qualidade_solicitada": qualidade,
-        "format_selector": common.get("format"),
-        "merge_output_format": common.get("merge_output_format"),
-        "extractor_args": common.get("extractor_args"),
-        "js_runtimes": common.get("js_runtimes"),
-        "tentativa": "download_real",
-        "resultado": None,
-        "erro": None,
-        "arquivos_na_pasta_antes": _arquivos_da_pasta(pasta_destino),
+        "tentativa": "download_real_v12_bgutil_script_explicito",
+        "resultado": "falha",
+        "cliente_sucesso": None,
+        "tentativas": [],
+        "configuracao_bgutil": {
+            "modo": "script",
+            "server_home": str(BGUTIL_SERVER),
+            "script_path": str(BGUTIL_SERVER / "build" / "generate_once.js"),
+        },
+        "observacao": (
+            "Teste controlado do mweb com BgUtils em modo script configurado "
+            "explicitamente. Não foram trocados simultaneamente outros clientes."
+        ),
     }
 
-    try:
-        with yt_dlp.YoutubeDL(common) as ydl:
-            retorno = ydl.download([url_normalizada])
-
-        diagnostico_download["resultado"] = {
-            "returncode": retorno,
-            "status": "concluido" if retorno == 0 else "retorno_nao_zero",
-        }
-        diagnostico_download["arquivos_na_pasta_depois"] = _arquivos_da_pasta(
-            pasta_destino
+    ultimo_erro = None
+    for indice, estrategia in enumerate(estrategias, start=1):
+        # A barra pode ser reutilizada; em caso de fallback, o hook continua válido.
+        tentativa = _download_uma_estrategia(
+            url_normalizada,
+            pasta_destino,
+            estrategia,
+            progress,
         )
-        diagnostico_download["logs"] = download_logger.linhas[-400:]
-        st.session_state["download_diagnostico"] = diagnostico_download
+        tentativa["ordem"] = indice
+        diagnostico_download["tentativas"].append(tentativa)
 
-    except yt_dlp.utils.DownloadError as exc:
-        msg = str(exc)
-        low = msg.lower()
+        if tentativa.get("resultado", {}).get("status") == "concluido":
+            diagnostico_download["resultado"] = {
+                "status": "concluido",
+                "returncode": tentativa["resultado"].get("returncode"),
+            }
+            diagnostico_download["cliente_sucesso"] = estrategia["cliente"]
+            diagnostico_download["format_selector_sucesso"] = estrategia["format"]
+            st.session_state["download_diagnostico"] = diagnostico_download
+            return _arquivo_final(pasta_destino, estrategia["extensao_final"])
 
-        diagnostico_download["resultado"] = "falha"
-        diagnostico_download["erro"] = {
-            "tipo": type(exc).__name__,
-            "mensagem": DiagnosticoLogger._redact(msg),
-            "tem_403": "403" in low or "forbidden" in low,
-        }
-        diagnostico_download["arquivos_na_pasta_depois"] = _arquivos_da_pasta(
-            pasta_destino
+        ultimo_erro = tentativa.get("erro")
+
+    st.session_state["download_diagnostico"] = diagnostico_download
+
+    mensagens = []
+    for tentativa in diagnostico_download["tentativas"]:
+        erro = tentativa.get("erro") or {}
+        mensagens.append(
+            f"{tentativa.get('cliente')}: {erro.get('mensagem') or tentativa.get('resultado')}"
         )
-        diagnostico_download["logs"] = download_logger.linhas[-400:]
-        st.session_state["download_diagnostico"] = diagnostico_download
 
-        if "403" in low or "forbidden" in low:
-            raise RuntimeError(
-                "O YouTube recusou o stream (HTTP 403). "
-                "O download foi interrompido, e o diagnóstico da tentativa real "
-                "foi salvo logo abaixo. Ele agora registra qual formato o yt-dlp "
-                "tentou baixar e em qual etapa ocorreu o 403."
-            ) from exc
+    tem_403 = any(
+        (t.get("erro") or {}).get("tem_403")
+        for t in diagnostico_download["tentativas"]
+    )
 
-        if "ffmpeg" in low or "ffprobe" in low:
-            raise RuntimeError(
-                "FFmpeg/FFprobe não está disponível no servidor. "
-                "O diagnóstico da tentativa real foi salvo logo abaixo."
-            ) from exc
-
+    if tem_403:
         raise RuntimeError(
-            f"Falha no download: {msg}"
-        ) from exc
-
-    except Exception as exc:
-        diagnostico_download["resultado"] = "falha"
-        diagnostico_download["erro"] = {
-            "tipo": type(exc).__name__,
-            "mensagem": DiagnosticoLogger._redact(str(exc)),
-        }
-        diagnostico_download["arquivos_na_pasta_depois"] = _arquivos_da_pasta(
-            pasta_destino
+            "Os métodos automáticos testados pelo servidor receberam HTTP 403. "
+            "O diagnóstico agora contém uma tentativa separada para cada cliente "
+            "e mostra qual deles foi recusado. Nenhuma credencial foi solicitada."
         )
-        diagnostico_download["logs"] = download_logger.linhas[-400:]
-        st.session_state["download_diagnostico"] = diagnostico_download
 
-        raise RuntimeError(
-            f"Erro durante o processamento: {exc}"
-        ) from exc
-
-    return _arquivo_final(pasta_destino, extensao_final)
+    raise RuntimeError(
+        "Nenhum dos métodos automáticos conseguiu concluir o download. "
+        + " | ".join(mensagens)
+    )
 
 
 def mostrar_metadados(info: Dict[str, Any]) -> None:
@@ -1157,7 +1249,7 @@ def mostrar_metadados(info: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.title("🎬 YouTube Downloader — Diagnóstico Completo V10")
+    st.title("🎬 YouTube Downloader — Diagnóstico Completo V12")
     st.caption("MP4 com áudio ou extração de áudio MP3 — processamento realizado no servidor.")
     st.info("Use somente conteúdo que você tenha autorização para baixar ou que seja permitido pelos termos e direitos aplicáveis.")
 
@@ -1310,21 +1402,45 @@ def main() -> None:
             )
             st.json({
                 "resultado": download_diag.get("resultado"),
-                "erro": download_diag.get("erro"),
+                "cliente_sucesso": download_diag.get("cliente_sucesso"),
                 "tipo": download_diag.get("tipo"),
                 "qualidade_solicitada": download_diag.get("qualidade_solicitada"),
-                "format_selector": download_diag.get("format_selector"),
-                "merge_output_format": download_diag.get("merge_output_format"),
-                "extractor_args": download_diag.get("extractor_args"),
-                "js_runtimes": download_diag.get("js_runtimes"),
-                "arquivos_na_pasta_antes": download_diag.get("arquivos_na_pasta_antes"),
-                "arquivos_na_pasta_depois": download_diag.get("arquivos_na_pasta_depois"),
+                "tentativa": download_diag.get("tentativa"),
+                "observacao": download_diag.get("observacao"),
             })
-            st.subheader("Log real do download")
-            st.code(
-                "\n".join(download_diag.get("logs") or ["Nenhum log capturado."]),
-                language="text",
-            )
+
+            tentativas = download_diag.get("tentativas") or []
+            if tentativas:
+                st.subheader("Métodos testados")
+                for tentativa in tentativas:
+                    cliente = tentativa.get("cliente", "desconhecido")
+                    erro = tentativa.get("erro") or {}
+                    status = tentativa.get("resultado")
+                    if isinstance(status, dict):
+                        status = status.get("status")
+                    if status == "concluido":
+                        st.success(f"{cliente}: download concluído")
+                    else:
+                        mensagem = erro.get("mensagem") or "falha sem mensagem"
+                        st.error(f"{cliente}: {mensagem}")
+
+                    with st.expander(f"Detalhes e log — {cliente}", expanded=False):
+                        st.json({
+                            "ordem": tentativa.get("ordem"),
+                            "format_selector": tentativa.get("format_selector"),
+                            "extractor_args": tentativa.get("extractor_args"),
+                            "resultado": tentativa.get("resultado"),
+                            "erro": tentativa.get("erro"),
+                            "arquivos_na_pasta_antes": tentativa.get("arquivos_na_pasta_antes"),
+                            "arquivos_na_pasta_depois": tentativa.get("arquivos_na_pasta_depois"),
+                        })
+                        st.code(
+                            "\n".join(tentativa.get("logs") or ["Nenhum log capturado."]),
+                            language="text",
+                        )
+            else:
+                st.subheader("Log real do download")
+                st.code("Nenhuma tentativa registrada.", language="text")
 
             download_diag_json = json.dumps(
                 download_diag,
@@ -1384,6 +1500,8 @@ def main() -> None:
 
     st.divider()
     if st.button("⬇️ Baixar arquivo", type="primary", use_container_width=True):
+        st.session_state.pop("download_error", None)
+        st.session_state.pop("download_diagnostico", None)
         if not ambiente_ok:
             st.error("O componente de acesso ao YouTube não está disponível.")
             return
