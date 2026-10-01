@@ -191,21 +191,54 @@ def preparar_ambiente() -> Dict[str, str]:
     _extrair_provider()
     deno = shutil.which("deno")
     script = BGUTIL_SERVER / "build" / "generate_once.js"
+    # Verificação real do executável, não apenas da existência do arquivo.
+    if deno:
+        teste = subprocess.run(
+            [deno, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20,
+        )
+        if teste.returncode != 0:
+            raise RuntimeError(
+                "O executável Deno foi encontrado, mas não conseguiu iniciar.\\n\\n"
+                + teste.stdout[-3000:]
+            )
+
     return {"deno": deno or "", "script": str(script)}
 
 
 def _opcoes_provider() -> Dict[str, Dict[str, str]]:
     ambiente = preparar_ambiente()
+
+    # O provider oficial aceita server_home/script_path. Usamos os dois de
+    # forma explícita para eliminar qualquer dependência do diretório HOME.
     return {
         "youtubepot-bgutilscript": {
+            "server_home": str(BGUTIL_SERVER),
             "script_path": ambiente["script"],
         }
     }
 
 
 def _opcoes_js() -> Dict[str, Any]:
+    ambiente = preparar_ambiente()
+    deno = ambiente.get("deno") or shutil.which("deno")
+
+    if not deno:
+        raise RuntimeError(
+            "Deno não foi localizado. O pacote deno está instalado, "
+            "mas o executável não está disponível para o yt-dlp."
+        )
+
+    # Não basta Deno existir no PATH do processo. O yt-dlp aceita um caminho
+    # explícito no formato equivalente a --js-runtimes deno:/caminho/deno.
+    # Isso evita exatamente o estado 'script-deno ... unavailable'.
     return {
-        "js_runtimes": {"deno": {}},
+        "js_runtimes": {
+            "deno": {"path": deno},
+        },
         "remote_components": {"ejs": ["github"]},
         "extractor_args": {
             "youtube": {"player_client": ["mweb", "default"]},
@@ -538,7 +571,7 @@ def mostrar_metadados(info: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.title("🎬 YouTube Downloader")
+    st.title("🎬 YouTube Downloader — Diagnóstico PO Token")
     st.caption("MP4 com áudio ou extração de áudio MP3 — processamento realizado no servidor.")
     st.info("Use somente conteúdo que você tenha autorização para baixar ou que seja permitido pelos termos e direitos aplicáveis.")
 
@@ -602,6 +635,7 @@ def main() -> None:
                 st.write(f"**Python:** `{diag.get('python')}`")
                 st.write(f"**Deno:** `{diag.get('deno')}`")
                 st.write(f"**BgUtils script:** `{diag.get('script')}`")
+                st.write("**Configuração do runtime JS:** `Deno com caminho explícito`")
                 st.write(f"**generate_once.js existe:** `{diag.get('script_existe')}`")
                 st.write("**Diretórios de plugins detectados:**")
                 st.code("\n".join(diag.get("plugin_dirs") or ["nenhum detectado"]))
