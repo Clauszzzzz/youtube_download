@@ -29,6 +29,10 @@ BGUTIL_VERSION = "2.0.0"
 BGUTIL_DIR = Path.home() / ".cache" / "bgutil-ytdlp-pot-provider"
 BGUTIL_SERVER = BGUTIL_DIR / "server"
 BGUTIL_ARCHIVE = BGUTIL_DIR / f"bgutil-{BGUTIL_VERSION}.tar.gz"
+BGUTIL_HTTP_HOST = "127.0.0.1"
+BGUTIL_HTTP_PORT = 4416
+BGUTIL_HTTP_URL = f"http://{BGUTIL_HTTP_HOST}:{BGUTIL_HTTP_PORT}"
+BGUTIL_HTTP_LOG = BGUTIL_DIR / "bgutil-http-server.log"
 
 # Resoluções apresentadas ao usuário. O app nunca mostra alturas "estranhas"
 # como 2026p; ele trabalha com padrões comuns e limita o download a eles.
@@ -106,18 +110,16 @@ def normalizar_url(url: str) -> str:
 
 
 def _extrair_provider() -> None:
-    """Baixa e prepara o BgUtils para o modo script (sem servidor HTTP)."""
+    """Baixa e prepara o BgUtils para o servidor HTTP local."""
     BGUTIL_DIR.mkdir(parents=True, exist_ok=True)
 
-    script = BGUTIL_SERVER / "build" / "generate_once.js"
-    if not (BGUTIL_SERVER / "src" / "generate_once.ts").exists():
+    if not (BGUTIL_SERVER / "src" / "main.ts").exists():
         url = (
             "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/"
             f"archive/refs/tags/{BGUTIL_VERSION}.tar.gz"
         )
         urllib.request.urlretrieve(url, BGUTIL_ARCHIVE)
 
-        # Extrai em um diretório temporário e depois move a pasta correta.
         temp_extract = BGUTIL_DIR / f"extract-{BGUTIL_VERSION}"
         if temp_extract.exists():
             shutil.rmtree(temp_extract)
@@ -160,71 +162,159 @@ def _extrair_provider() -> None:
                 + resultado.stdout[-5000:]
             )
 
-    if not script.exists():
-        # O modo script do BgUtils exige o JavaScript transpilado em build/.
-        # Deno consegue executar o tsc do npm sem instalar Node.js no servidor.
-        resultado = subprocess.run(
-            [
-                deno,
-                "x",
-                "-p",
-                "typescript@6.0.3",
-                "tsc",
-                "--project",
-                "tsconfig.json",
-            ],
-            cwd=BGUTIL_SERVER,
-            stdout=subprocess.PIPE,
+    if not node_modules.is_dir():
+        raise RuntimeError("O BgUtils foi baixado, mas node_modules não foi criado.")
+
+
+def _ping_bgutil_http(timeout: float = 2.0) -> Dict[str, Any]:
+    """Verifica se o servidor HTTP local do BgUtils está respondendo."""
+    url = f"{BGUTIL_HTTP_URL}/ping"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            corpo = response.read().decode("utf-8", "replace")
+            try:
+                dados = json.loads(corpo)
+            except json.JSONDecodeError:
+                dados = {"raw": corpo}
+            return {"ok": True, "url": url, "status_code": response.status, "resposta": dados}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "url": url,
+            "status_code": None,
+            "erro": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _tail_bgutil_log(limite: int = 12000) -> str:
+    try:
+        if BGUTIL_HTTP_LOG.is_file():
+            return DiagnosticoLogger._redact(BGUTIL_HTTP_LOG.read_text(encoding="utf-8", errors="replace"))[-limite:]
+    except Exception:
+        pass
+    return ""
+
+
+def _iniciar_bgutil_http(deno: str) -> Dict[str, Any]:
+    """Inicia uma única instância do servidor BgUtils HTTP em localhost:4416."""
+    existente = _ping_bgutil_http(timeout=1.5)
+    if existente.get("ok"):
+        return {
+            "status": "JA_ESTAVA_ATIVO",
+            "url": BGUTIL_HTTP_URL,
+            "pid": None,
+            "ping": existente,
+            "log": _tail_bgutil_log(),
+        }
+
+    BGUTIL_DIR.mkdir(parents=True, exist_ok=True)
+    main_ts = BGUTIL_SERVER / "src" / "main.ts"
+    node_modules = BGUTIL_SERVER / "node_modules"
+    if not main_ts.is_file():
+        raise RuntimeError(f"O servidor HTTP do BgUtils não foi encontrado: {main_ts}")
+
+    log_handle = open(BGUTIL_HTTP_LOG, "a", encoding="utf-8")
+    cmd = [
+        deno,
+        "run",
+        "--no-prompt",
+        "--allow-env",
+        "--allow-net",
+        f"--allow-ffi={node_modules.resolve()}",
+        f"--allow-read={node_modules.resolve()}",
+        f"--allow-read={BGUTIL_SERVER.resolve()}",
+        f"--allow-write={BGUTIL_DIR.resolve()}",
+        "--allow-sys",
+        "../src/main.ts",
+        "--host",
+        BGUTIL_HTTP_HOST,
+        "--port",
+        str(BGUTIL_HTTP_PORT),
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=node_modules,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=300,
+            env=os.environ.copy(),
         )
-        if resultado.returncode != 0:
+    except Exception:
+        log_handle.close()
+        raise
+
+    # O arquivo de log permanece aberto pelo processo filho. No processo
+    # Streamlit fechamos apenas a referência Python; o descritor herdado segue
+    # válido para o servidor.
+    log_handle.close()
+
+    prazo = time.time() + 25
+    ultimo_ping = None
+    while time.time() < prazo:
+        if proc.poll() is not None:
             raise RuntimeError(
-                "Falha ao compilar o BgUtils para o modo script.\n\n"
-                + resultado.stdout[-6000:]
+                "O servidor HTTP do BgUtils encerrou durante a inicialização.\n\n"
+                + _tail_bgutil_log()
             )
+        ultimo_ping = _ping_bgutil_http(timeout=1.5)
+        if ultimo_ping.get("ok"):
+            return {
+                "status": "INICIADO",
+                "url": BGUTIL_HTTP_URL,
+                "pid": proc.pid,
+                "ping": ultimo_ping,
+                "log": _tail_bgutil_log(),
+            }
+        time.sleep(0.4)
 
-    if not script.exists():
-        raise RuntimeError(f"O script compilado do BgUtils não foi encontrado: {script}")
-
-    return None
+    raise RuntimeError(
+        "O servidor HTTP do BgUtils não respondeu em até 25 segundos.\n\n"
+        + (_tail_bgutil_log() or str(ultimo_ping or "sem resposta ao /ping"))
+    )
 
 
 @st.cache_resource(show_spinner=False)
-def preparar_ambiente() -> Dict[str, str]:
-    """Prepara Deno/BgUtils uma única vez por instância do Streamlit."""
+def preparar_ambiente() -> Dict[str, Any]:
+    """Prepara Deno/BgUtils e mantém o servidor HTTP vivo na instância."""
     _extrair_provider()
     deno = shutil.which("deno")
-    script = BGUTIL_SERVER / "build" / "generate_once.js"
-    # Verificação real do executável, não apenas da existência do arquivo.
-    if deno:
-        teste = subprocess.run(
-            [deno, "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=20,
-        )
-        if teste.returncode != 0:
-            raise RuntimeError(
-                "O executável Deno foi encontrado, mas não conseguiu iniciar.\\n\\n"
-                + teste.stdout[-3000:]
-            )
+    if not deno:
+        raise RuntimeError("Deno não foi localizado. O pacote deno está instalado, mas o executável não está disponível.")
 
-    return {"deno": deno or "", "script": str(script)}
+    teste = subprocess.run(
+        [deno, "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=20,
+    )
+    if teste.returncode != 0:
+        raise RuntimeError(
+            "O executável Deno foi encontrado, mas não conseguiu iniciar.\n\n"
+            + teste.stdout[-3000:]
+        )
+
+    servidor = _iniciar_bgutil_http(deno)
+    script = BGUTIL_SERVER / "build" / "generate_once.js"
+    return {
+        "deno": deno,
+        "script": str(script),
+        "bgutil_http": servidor,
+        "bgutil_http_url": BGUTIL_HTTP_URL,
+    }
 
 
 def _opcoes_provider() -> Dict[str, Dict[str, str]]:
     preparar_ambiente()
-
-    # Usamos server_home e script_path explícitos. server_home é a configuração
-    # oficial para instalação fora do HOME; script_path adicionalmente elimina
-    # qualquer ambiguidade na resolução do generate_once.js.
+    # O modo HTTP é preferível aqui porque o próprio plugin conversa com o
+    # servidor local. Isso elimina a etapa em que o modo script aparecia como
+    # "external, unavailable" no diagnóstico anterior.
     return {
-        "youtubepot-bgutilscript": {
-            "server_home": str(BGUTIL_SERVER),
-            "script_path": str(BGUTIL_SERVER / "build" / "generate_once.js"),
+        "youtubepot-bgutilhttp": {
+            "base_url": BGUTIL_HTTP_URL,
         }
     }
 
@@ -514,6 +604,11 @@ def _resumo_diagnostico(info: Dict[str, Any], logger: DiagnosticoLogger, ambient
         "environment": _variaveis_ambiente_relevantes(),
         "filesystem": filesystem,
         "commands": comandos,
+        "bgutil_http": {
+            "url": BGUTIL_HTTP_URL,
+            "ping": _ping_bgutil_http(timeout=2.0),
+            "log_tail": _tail_bgutil_log(),
+        },
         "logs_completos": logger.linhas[-500:],
         "formatos": formatos,
         "info_resumo": {
@@ -558,20 +653,62 @@ def _testar_pot_direto(ambiente: Dict[str, str], video_id: str) -> Dict[str, Any
         "--content-binding", video_id,
         "--bypass-cache",
     ]
-    resultado = _executar_comando(cmd, cwd=server_home, timeout=120)
-    bruto = resultado.get("saida", "")
+    # Aqui precisamos do stdout bruto internamente para detectar o poToken.
+    # A saída nunca é mostrada sem passar por _redact antes de entrar no
+    # diagnóstico.
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(server_home),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            env=os.environ.copy(),
+        )
+        bruto = proc.stdout or ""
+        resultado = {
+            "returncode": proc.returncode,
+            "timeout": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        saida = exc.stdout or ""
+        if isinstance(saida, bytes):
+            saida = saida.decode("utf-8", "replace")
+        bruto = saida
+        resultado = {
+            "returncode": None,
+            "timeout": True,
+        }
+    except Exception as exc:
+        bruto = ""
+        resultado = {
+            "returncode": None,
+            "timeout": False,
+            "erro": f"{type(exc).__name__}: {exc}",
+        }
+
     texto = DiagnosticoLogger._redact(bruto)
 
     pot = None
     content_binding = None
     expires_at = None
-    try:
-        dados = json.loads(bruto)
-        pot = dados.get("poToken")
-        content_binding = dados.get("contentBinding")
-        expires_at = dados.get("expiresAt")
-    except Exception:
-        pass
+    # O BgUtils pode escrever uma linha de diagnóstico do Deno antes do JSON.
+    # Por isso json.loads(bruto) inteiro pode falhar mesmo quando o token foi
+    # gerado corretamente. Procuramos o último objeto JSON válido com poToken.
+    for linha in reversed(bruto.splitlines()):
+        linha = linha.strip()
+        if not linha or not linha.startswith("{"):
+            continue
+        try:
+            dados = json.loads(linha)
+        except Exception:
+            continue
+        if isinstance(dados, dict) and dados.get("poToken"):
+            pot = dados.get("poToken")
+            content_binding = dados.get("contentBinding")
+            expires_at = dados.get("expiresAt")
+            break
 
     return {
         "status": "PO_TOKEN_GERADO" if pot else "FALHA",
@@ -587,6 +724,7 @@ def _testar_pot_direto(ambiente: Dict[str, str], video_id: str) -> Dict[str, Any
         "poToken_presente": bool(pot),
         "comando_redigido": f"{deno} run ... {script_path} --content-binding [OCULTO] --bypass-cache",
         "saida_redigida": texto[-12000:],
+        "erro_execucao": resultado.get("erro"),
     }
 
 
@@ -673,6 +811,11 @@ def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "motivo": "não foi possível identificar o video_id na URL",
     }
     script_version = _testar_script_version(ambiente)
+    bgutil_http = {
+        "url": BGUTIL_HTTP_URL,
+        "ping": _ping_bgutil_http(timeout=2.0),
+        "log_tail": _tail_bgutil_log(),
+    }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -684,12 +827,14 @@ def diagnosticar_video(url: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         diag["config_efetiva"] = config
         diag["pot_direto"] = pot_direto
         diag["script_version_deno"] = script_version
+        diag["bgutil_http"] = bgutil_http
         raise DiagnosticoErro(diag)
 
     diag = _resumo_diagnostico(info, logger, ambiente)
     diag["config_efetiva"] = config
     diag["pot_direto"] = pot_direto
     diag["script_version_deno"] = script_version
+    diag["bgutil_http"] = bgutil_http
     return info, diag
 
 def extrair_info_video(url: str) -> Dict[str, Any]:
@@ -916,7 +1061,7 @@ def mostrar_metadados(info: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.title("🎬 YouTube Downloader — Diagnóstico Completo")
+    st.title("🎬 YouTube Downloader — Diagnóstico Completo V7")
     st.caption("MP4 com áudio ou extração de áudio MP3 — processamento realizado no servidor.")
     st.info("Use somente conteúdo que você tenha autorização para baixar ou que seja permitido pelos termos e direitos aplicáveis.")
 
@@ -995,7 +1140,7 @@ def main() -> None:
                 "home": diag.get("home"),
             })
 
-            st.subheader("2. BgUtils / Deno")
+            st.subheader("2. BgUtils / Deno / servidor HTTP")
             st.json({
                 "deno": diag.get("deno"),
                 "bgutil_dir": diag.get("bgutil_dir"),
@@ -1003,34 +1148,42 @@ def main() -> None:
                 "generate_once_js": diag.get("script"),
                 "generate_once_existe": diag.get("script_existe"),
                 "generate_once_bytes": diag.get("script_bytes"),
+                "http_server": diag.get("bgutil_http"),
             })
 
-            st.subheader("3. Configuração efetiva do yt-dlp")
+            st.subheader("3. Testes de PO Token")
+            st.json({
+                "servidor_http": diag.get("bgutil_http"),
+                "geracao_direta": diag.get("pot_direto"),
+                "versao_generate_once": diag.get("script_version_deno"),
+            })
+
+            st.subheader("4. Configuração efetiva do yt-dlp")
             st.json(diag.get("config_efetiva", {}))
 
-            st.subheader("4. Descoberta do plugin")
+            st.subheader("5. Descoberta do plugin")
             st.write("**Diretórios de plugins vistos pelo yt-dlp:**")
             st.code("\n".join(diag.get("plugin_dirs") or ["nenhum detectado"]))
             st.json(diag.get("plugin_modules", {}))
 
-            st.subheader("5. Arquivos relevantes")
+            st.subheader("6. Arquivos relevantes")
             for raiz, dados in (diag.get("filesystem") or {}).items():
                 with st.expander(f"`{raiz}` — {'EXISTE' if dados.get('existe') else 'não existe'}"):
                     st.json(dados)
 
-            st.subheader("6. Runtimes e ferramentas")
+            st.subheader("7. Runtimes e ferramentas")
             st.json(diag.get("commands", {}))
 
-            st.subheader("7. Variáveis de ambiente relevantes")
+            st.subheader("8. Variáveis de ambiente relevantes")
             st.json(diag.get("environment", {}))
 
-            st.subheader("8. Logs completos do yt-dlp / BgUtils / PO Token")
+            st.subheader("9. Logs completos do yt-dlp / BgUtils / PO Token")
             st.code("\n".join(diag.get("logs_completos") or ["Nenhum log foi capturado."]), language="text")
 
-            st.subheader("9. Resumo da extração")
+            st.subheader("10. Resumo da extração")
             st.json(diag.get("info_resumo", {}))
 
-            st.subheader("10. Formatos retornados pelo YouTube")
+            st.subheader("11. Formatos retornados pelo YouTube")
             formatos_diag = diag.get("formatos") or []
             if formatos_diag:
                 st.dataframe(formatos_diag, use_container_width=True, hide_index=True)
