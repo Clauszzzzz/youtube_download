@@ -14,15 +14,18 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import streamlit as st
 import yt_dlp
 
-st.set_page_config(page_title='YouTube Downloader — V19', page_icon='🎬', layout='wide')
+APP_VERSION = '0.1'
 
-CLIENTES = ['tv', 'ios', 'mweb', 'android_vr', 'web_embedded', 'android']
+st.set_page_config(page_title=f'YouTube Downloader — v{APP_VERSION}', page_icon='🎬', layout='wide')
+
+CLIENTES_SEM_COOKIES = ['web_embedded', 'mweb', 'android_vr', 'tv', 'ios']
+CLIENTES_COM_COOKIES = ['web', 'mweb', 'web_embedded', 'tv', 'ios', 'android_vr']
 RESOLUCOES = [2160, 1440, 1080, 720, 480, 360, 240, 144]
-MAX_BYTES = 200 * 1024 * 1024  # 200 MB evita estouro de RAM (OOM) no Streamlit Cloud
+MAX_BYTES = 200 * 1024 * 1024  # Limite seguro de 200 MB para a RAM do Streamlit Cloud
 
 
 def redigir(texto: str) -> str:
-    """Remove segredos e sanitiza URLs assinadas preservando parâmetros úteis de rede."""
+    """Remove tokens/cookies e sanitiza URLs assinadas preservando pistas de rede."""
     texto = str(texto)
 
     def sanitize_googlevideo(match):
@@ -94,10 +97,10 @@ def detect_js_runtimes() -> dict[str, Any]:
     return runtimes
 
 
-def get_environment_info(cookies_loaded: bool = False) -> dict[str, Any]:
+def get_environment_info(cookies_loaded: bool = False, force_ipv4: bool = False) -> dict[str, Any]:
     runtimes = detect_js_runtimes()
     return {
-        'app_version': 'V19',
+        'app_version': f'v{APP_VERSION}',
         'timestamp_utc': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
         'yt_dlp_version': yt_dlp.version.__version__,
         'python_version': platform.python_version(),
@@ -108,11 +111,17 @@ def get_environment_info(cookies_loaded: bool = False) -> dict[str, Any]:
         'node_check': run_cmd(['node', '--version']) if 'node' in runtimes else 'não encontrado',
         'ffmpeg_check': run_cmd(['ffmpeg', '-version']) if shutil.which('ffmpeg') else 'não encontrado',
         'cookies_uploaded': cookies_loaded,
-        'force_ipv4': True,
+        'force_ipv4': force_ipv4,
     }
 
 
-def yt_opts(cliente: str, download: bool = False, cookiefile: Optional[str] = None, **extra: Any) -> dict[str, Any]:
+def yt_opts(
+    cliente: str,
+    download: bool = False,
+    cookiefile: Optional[str] = None,
+    force_ipv4: bool = False,
+    **extra: Any,
+) -> dict[str, Any]:
     opts: dict[str, Any] = {
         'noplaylist': True,
         'quiet': not download,
@@ -121,10 +130,12 @@ def yt_opts(cliente: str, download: bool = False, cookiefile: Optional[str] = No
         'socket_timeout': 30,
         'retries': 3,
         'fragment_retries': 3,
-        'source_address': '0.0.0.0',
         'extractor_args': {'youtube': {'player_client': [cliente]}},
         **extra,
     }
+    if force_ipv4:
+        opts['source_address'] = '0.0.0.0'
+
     runtimes = detect_js_runtimes()
     if runtimes:
         opts['js_runtimes'] = runtimes
@@ -133,7 +144,12 @@ def yt_opts(cliente: str, download: bool = False, cookiefile: Optional[str] = No
     return opts
 
 
-def extract(url: str, cliente: str, cookiefile: Optional[str] = None) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+def extract(
+    url: str,
+    cliente: str,
+    cookiefile: Optional[str] = None,
+    force_ipv4: bool = False,
+) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
     logs: list[str] = []
 
     class Logger:
@@ -143,7 +159,7 @@ def extract(url: str, cliente: str, cookiefile: Optional[str] = None) -> tuple[O
         def error(self, msg): logs.append('ERROR: ' + redigir(msg))
 
     try:
-        opts = yt_opts(cliente, cookiefile=cookiefile, logger=Logger(), skip_download=True)
+        opts = yt_opts(cliente, cookiefile=cookiefile, force_ipv4=force_ipv4, logger=Logger(), skip_download=True)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         formats = info.get('formats') or []
@@ -231,6 +247,7 @@ def download_one(
     quality: int,
     folder: str,
     cookiefile: Optional[str] = None,
+    force_ipv4: bool = False,
     hook=None,
 ) -> dict[str, Any]:
     logs: list[str] = []
@@ -261,6 +278,7 @@ def download_one(
         cliente,
         download=True,
         cookiefile=cookiefile,
+        force_ipv4=force_ipv4,
         logger=Logger(),
         outtmpl=str(Path(folder) / '%(title).180s.%(ext)s'),
         progress_hooks=[hook] if hook else [],
@@ -293,12 +311,12 @@ def download_one(
     return result
 
 
-def build_diagnostic_report(cookies_loaded: bool) -> str:
+def build_diagnostic_report(cookies_loaded: bool, force_ipv4: bool) -> str:
     """Gera um relatório técnico legível em texto puro (.txt) para análise."""
-    env = get_environment_info(cookies_loaded=cookies_loaded)
+    env = get_environment_info(cookies_loaded=cookies_loaded, force_ipv4=force_ipv4)
     lines: list[str] = [
         '====================================================================',
-        'RELATÓRIO DE DIAGNÓSTICO — YOUTUBE DOWNLOADER (V19)',
+        f'RELATÓRIO DE DIAGNÓSTICO — YOUTUBE DOWNLOADER (v{APP_VERSION})',
         '====================================================================',
         '',
         '## 1. INFORMAÇÕES DA APLICAÇÃO E AMBIENTE',
@@ -357,15 +375,20 @@ def build_diagnostic_report(cookies_loaded: bool) -> str:
 
 
 def main():
-    st.title('🎬 YouTube Downloader — V19')
-    st.caption('Com fallback automático de clientes, suporte a cookies.txt e exportação de relatório em .txt.')
+    st.title(f'🎬 YouTube Downloader — v{APP_VERSION}')
+    st.caption('Rede automática (sem conflito IPv4/IPv6), fallback de clientes, cookies.txt opcional e relatório .txt.')
 
-    with st.expander('Ambiente e Cookies (opcional para evitar Erro 403 na nuvem)', expanded=False):
+    with st.expander('⚙️ Configurações, Ambiente e Cookies (recomendado na nuvem)', expanded=False):
         cookies_upload = st.file_uploader(
-            'Arquivo cookies.txt (formato Netscape) — use se o servidor receber bloqueio 403',
+            'Arquivo cookies.txt (formato Netscape) — recomendado se o servidor tomar bloqueio 403 do YouTube',
             type=['txt'],
         )
-        st.json(get_environment_info(cookies_loaded=cookies_upload is not None))
+        force_ipv4 = st.checkbox(
+            'Forçar IPv4 (source_address = 0.0.0.0)',
+            value=False,
+            help='Deixe desmarcado por padrão para evitar conflito com links assinados em IPv6.',
+        )
+        st.json(get_environment_info(cookies_loaded=cookies_upload is not None, force_ipv4=force_ipv4))
 
     url = st.text_input(
         'URL do YouTube',
@@ -375,11 +398,7 @@ def main():
     if url:
         st.session_state['url'] = url
 
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        analyze = st.button('🔎 Analisar vídeo', type='primary', use_container_width=True)
-    with c2:
-        diag_btn = st.button('🧪 Diagnóstico completo', use_container_width=True)
+    analyze = st.button('🔎 Analisar vídeo', type='primary', use_container_width=True)
 
     cookie_path = None
     if cookies_upload is not None:
@@ -388,8 +407,10 @@ def main():
         tmp_cookie.close()
         cookie_path = tmp_cookie.name
 
+    clientes_ativos = CLIENTES_COM_COOKIES if cookie_path else CLIENTES_SEM_COOKIES
+
     try:
-        if analyze or diag_btn:
+        if analyze:
             st.session_state.pop('ready_file', None)
             st.session_state.pop('download_attempts', None)
             st.session_state.pop('fatal_error', None)
@@ -397,9 +418,9 @@ def main():
                 u = normalize_url(url)
                 results = []
                 infos = []
-                for client in CLIENTES:
+                for client in clientes_ativos:
                     with st.spinner(f'Testando cliente {client}...'):
-                        info, result = extract(u, client, cookiefile=cookie_path)
+                        info, result = extract(u, client, cookiefile=cookie_path, force_ipv4=force_ipv4)
                     results.append(result)
                     if info:
                         infos.append((result['max_height'], client, info))
@@ -456,7 +477,7 @@ def main():
 
             if (media_label.startswith('Apenas') or options) and st.button('⬇️ Baixar arquivo', type='primary', use_container_width=True):
                 st.session_state.pop('ready_file', None)
-                working_clients = [c for _, c, _ in st.session_state.get('client_infos', [])] or CLIENTES
+                working_clients = [c for _, c, _ in st.session_state.get('client_infos', [])] or clientes_ativos
                 bar = st.progress(0)
                 status = st.empty()
 
@@ -477,9 +498,16 @@ def main():
 
                 for client in working_clients:
                     status.info(f'Tentando download via cliente `{client}`...')
-                    with tempfile.TemporaryDirectory(prefix='yt_v19_') as folder:
+                    with tempfile.TemporaryDirectory(prefix='yt_v01_') as folder:
                         result = download_one(
-                            normalize_url(url), client, media, quality, folder, cookiefile=cookie_path, hook=hook
+                            normalize_url(url),
+                            client,
+                            media,
+                            quality,
+                            folder,
+                            cookiefile=cookie_path,
+                            force_ipv4=force_ipv4,
+                            hook=hook,
                         )
                         attempts.append(result)
                         st.session_state['download_attempts'] = attempts
@@ -517,19 +545,18 @@ def main():
                 key='save_final_file',
             )
 
-        # Botão sempre visível após qualquer análise/tentativa para exportar o relatório completo em .txt
         if st.session_state.get('client_results') or st.session_state.get('download_attempts') or st.session_state.get('fatal_error'):
             st.divider()
-            st.subheader('📋 Relatório de Diagnóstico')
-            st.caption('Se algo falhar, baixe este arquivo .txt e anexe aqui no chat para eu analisar exatamente o que ocorreu.')
-            report_text = build_diagnostic_report(cookies_loaded=cookies_upload is not None)
+            st.subheader(f'📋 Relatório de Diagnóstico (v{APP_VERSION})')
+            st.caption('Se algo falhar, baixe este arquivo .txt e envie aqui no chat para analisarmos o próximo ajuste.')
+            report_text = build_diagnostic_report(cookies_loaded=cookies_upload is not None, force_ipv4=force_ipv4)
             st.download_button(
-                '📄 Baixar relatório de erro (.txt)',
+                f'📄 Baixar relatório v{APP_VERSION} (.txt)',
                 report_text.encode('utf-8'),
-                'relatorio_yt_downloader_v19.txt',
+                f'relatorio_yt_downloader_v{APP_VERSION}.txt',
                 'text/plain',
                 use_container_width=True,
-                key='download_txt_report_v19',
+                key='download_txt_report_v01',
             )
     finally:
         if cookie_path and os.path.exists(cookie_path):
