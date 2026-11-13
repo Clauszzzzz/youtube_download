@@ -1,613 +1,438 @@
-from datetime import datetime, timezone
-import importlib.util
+import base64
 import os
-import platform
 import re
 import shutil
-import subprocess
 import tempfile
-import traceback
 from pathlib import Path
-from typing import Any, Optional
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import streamlit as st
 import yt_dlp
 
-APP_VERSION = '0.1.1'
+APP_VERSION = "v1.0"
 
-st.set_page_config(page_title=f'YouTube Downloader — v{APP_VERSION}', page_icon='🎬', layout='wide')
-
-CLIENTES_SEM_COOKIES = ['web_embedded', 'mweb', 'android_vr', 'tv', 'ios']
-CLIENTES_COM_COOKIES = ['web', 'mweb', 'web_embedded', 'tv', 'ios', 'android_vr']
-RESOLUCOES = [2160, 1440, 1080, 720, 480, 360, 240, 144]
-MAX_BYTES = 200 * 1024 * 1024  # Limite seguro de 200 MB para a RAM do Streamlit Cloud
-
-
-def redigir(texto: str) -> str:
-    """Remove tokens/cookies e sanitiza URLs assinadas preservando pistas de rede."""
-    texto = str(texto)
-
-    def sanitize_googlevideo(match):
-        raw = match.group(0)
-        try:
-            u = urlparse(raw)
-            q = parse_qs(u.query)
-            keep = {k: q[k][0] for k in ('ip', 'itag', 'c', 'mime') if k in q and q[k]}
-            query = '&'.join(f'{k}={v}' for k, v in keep.items())
-            return f'{u.scheme}://{u.netloc}{u.path}' + (f'?{query}' if query else '?[PARAMETROS_OCULTOS]')
-        except Exception:
-            return '[URL_GOOGLEVIDEO_OCULTA]'
-
-    texto = re.sub(r'https?://[^\s"\']*googlevideo\.com[^\s"\']*', sanitize_googlevideo, texto, flags=re.I)
-
-    patterns = [
-        (r'(?i)(authorization\s*[:=]\s*)\S+', r'\1[OCULTO]'),
-        (r'(?i)(cookie\s*[:=]\s*)\S+', r'\1[OCULTO]'),
-        (r'(?i)(po.?token[^=:\n]*[=:]\s*)[^\s,;]+', r'\1[OCULTO]'),
-        (r'(?i)(visitor[-_ ]data[^=:\n]*[=:]\s*)[^\s,;]+', r'\1[OCULTO]'),
-        (r'(?i)(data[-_ ]sync[-_ ]id[^=:\n]*[=:]\s*)[^\s,;]+', r'\1[OCULTO]'),
-    ]
-    for pattern, repl in patterns:
-        texto = re.sub(pattern, repl, texto)
-    return texto[-25000:]
+st.set_page_config(
+    page_title="YouTube Downloader",
+    page_icon="🎬",
+    layout="centered",
+)
 
 
-def download_url_network_hints(logs: list[str]) -> dict[str, Any]:
-    joined = '\n'.join(logs)
-    m = re.search(r'https?://[^\s"\']*googlevideo\.com[^\s"\']*', joined, flags=re.I)
-    if not m:
-        return {'googlevideo_url_found': False}
-    raw = m.group(0)
-    try:
-        u = urlparse(raw)
-        q = parse_qs(u.query)
-        ip = q.get('ip', [None])[0]
-        family = 'IPv6' if ip and ':' in ip else ('IPv4' if ip else 'desconhecida')
-        return {
-            'googlevideo_url_found': True,
-            'host': u.netloc,
-            'ip_parameter_present': bool(ip),
-            'ip_family_in_url': family,
-            'ip_parameter': ip,
-            'itag': q.get('itag', [None])[0],
-            'client_parameter_c': q.get('c', [None])[0],
-        }
-    except Exception as e:
-        return {'googlevideo_url_found': True, 'parse_error': f'{type(e).__name__}: {e}'}
+def is_local_windows() -> bool:
+    return os.name == "nt"
 
 
-def run_cmd(cmd: list[str], timeout: int = 15) -> str:
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
-        first_line = (p.stdout or '').strip().splitlines()[0] if (p.stdout or '').strip() else ''
-        return f'OK (rc={p.returncode}): {first_line[:120]}'
-    except Exception as e:
-        return f'ERRO: {type(e).__name__}: {e}'
+def get_downloads_dir() -> Path:
+    downloads = Path.home() / "Downloads"
+    if downloads.exists():
+        return downloads
+    return Path.cwd()
 
 
-def detect_js_runtimes() -> dict[str, Any]:
-    runtimes = {}
-    deno = shutil.which('deno')
-    node = shutil.which('node')
-    if deno:
-        runtimes['deno'] = {'path': deno}
-    if node:
-        runtimes['node'] = {'path': node}
-    return runtimes
+def detect_deno_path() -> str | None:
+    found = shutil.which("deno")
+    if found:
+        return found
+    for candidate in (
+        Path.home() / ".deno" / "bin" / "deno.exe",
+        Path("/home/adminuser/venv/bin/deno"),
+        Path.home() / ".deno" / "bin" / "deno",
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
-def resolve_cookies_source(uploaded_file) -> tuple[Optional[str], str]:
-    """Resolve cookies a partir do upload na interface ou de st.secrets['YOUTUBE_COOKIES']."""
-    if uploaded_file is not None:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
-        tmp.write(uploaded_file.getvalue())
+def get_cookie_file() -> str | None:
+    uploaded = st.session_state.get("uploaded_cookies_bytes")
+    if uploaded:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="wb")
+        tmp.write(uploaded)
         tmp.close()
-        return tmp.name, 'upload_interface'
+        return tmp.name
 
     try:
-        secret_cookies = st.secrets.get('YOUTUBE_COOKIES', '').strip()
-        if secret_cookies:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w', encoding='utf-8')
-            tmp.write(secret_cookies + '\n')
+        if "YOUTUBE_COOKIES" in st.secrets and str(st.secrets["YOUTUBE_COOKIES"]).strip():
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
+            tmp.write(str(st.secrets["YOUTUBE_COOKIES"]).strip() + "\n")
             tmp.close()
-            return tmp.name, 'streamlit_secrets'
+            return tmp.name
     except Exception:
         pass
 
-    return None, 'nenhum'
+    return None
 
 
-def get_environment_info(cookies_source: str = 'nenhum', force_ipv4: bool = False) -> dict[str, Any]:
-    runtimes = detect_js_runtimes()
-    return {
-        'app_version': f'v{APP_VERSION}',
-        'timestamp_utc': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
-        'yt_dlp_version': yt_dlp.version.__version__,
-        'python_version': platform.python_version(),
-        'platform': platform.platform(),
-        'curl_cffi_installed': bool(importlib.util.find_spec('curl_cffi')),
-        'js_runtimes_detected': list(runtimes.keys()) or ['nenhum'],
-        'deno_check': run_cmd(['deno', '--version']) if 'deno' in runtimes else 'não encontrado',
-        'node_check': run_cmd(['node', '--version']) if 'node' in runtimes else 'não encontrado',
-        'ffmpeg_check': run_cmd(['ffmpeg', '-version']) if shutil.which('ffmpeg') else 'não encontrado',
-        'cookies_source': cookies_source,
-        'force_ipv4': force_ipv4,
+def apply_custom_background():
+    bg_data_uri = None
+    bg_file = st.session_state.get("bg_file_bytes")
+    bg_mime = st.session_state.get("bg_file_mime", "image/jpeg")
+    bg_url = (st.session_state.get("bg_image_url") or "").strip()
+    overlay_opacity = st.session_state.get("bg_overlay_opacity", 0.72)
+
+    if bg_file:
+        b64 = base64.b64encode(bg_file).decode("utf-8")
+        bg_data_uri = f"data:{bg_mime};base64,{b64}"
+    elif bg_url:
+        bg_data_uri = bg_url
+
+    if not bg_data_uri:
+        return
+
+    st.markdown(
+        f"""
+        <style>
+        .stApp {{
+            background-image: linear-gradient(
+                rgba(10, 12, 18, {overlay_opacity}),
+                rgba(10, 12, 18, {overlay_opacity})
+            ), url("{bg_data_uri}");
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+        }}
+        [data-testid="stHeader"] {{
+            background: rgba(0, 0, 0, 0);
+        }}
+        .block-container {{
+            background: rgba(18, 22, 31, 0.78);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 2rem 2rem 2.5rem 2rem;
+            margin-top: 1.5rem;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def sanitize_filename(name: str) -> str:
+    cleaned = re.sub(r'[\\/*?:"<>|]', "", name).strip()
+    return cleaned[:160] or "video_youtube"
+
+
+def format_duration(seconds: int | float | None) -> str:
+    if not seconds:
+        return "Desconhecida"
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def build_base_ydl_opts(client: str, cookiefile: str | None) -> dict:
+    opts = {
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_args": {"youtube": {"player_client": [client]}},
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/145.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
     }
-
-
-def yt_opts(
-    cliente: str,
-    download: bool = False,
-    cookiefile: Optional[str] = None,
-    force_ipv4: bool = False,
-    **extra: Any,
-) -> dict[str, Any]:
-    opts: dict[str, Any] = {
-        'noplaylist': True,
-        'quiet': not download,
-        'no_warnings': False,
-        'verbose': True,
-        'socket_timeout': 30,
-        'retries': 3,
-        'fragment_retries': 3,
-        'extractor_args': {'youtube': {'player_client': [cliente]}},
-        **extra,
-    }
-    if force_ipv4:
-        opts['source_address'] = '0.0.0.0'
-
-    runtimes = detect_js_runtimes()
-    if runtimes:
-        opts['js_runtimes'] = runtimes
+    deno_path = detect_deno_path()
+    if deno_path:
+        opts["js_runtimes"] = {"deno": {"path": deno_path}}
     if cookiefile:
-        opts['cookiefile'] = cookiefile
+        opts["cookiefile"] = cookiefile
     return opts
 
 
-def extract(
-    url: str,
-    cliente: str,
-    cookiefile: Optional[str] = None,
-    force_ipv4: bool = False,
-) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
-    logs: list[str] = []
-
-    class Logger:
-        def debug(self, msg): logs.append(redigir(msg))
-        def info(self, msg): logs.append(redigir(msg))
-        def warning(self, msg): logs.append('WARNING: ' + redigir(msg))
-        def error(self, msg): logs.append('ERROR: ' + redigir(msg))
+def analyze_video(url: str) -> tuple[dict, str]:
+    cookiefile = get_cookie_file()
+    clients = ["web_embedded", "mweb", "android_vr"] if not cookiefile else ["web_embedded", "mweb"]
+    last_error = None
 
     try:
-        opts = yt_opts(cliente, cookiefile=cookiefile, force_ipv4=force_ipv4, logger=Logger(), skip_download=True)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        formats = info.get('formats') or []
-        heights = sorted(
-            {int(f['height']) for f in formats if f.get('height') and f.get('vcodec') not in (None, 'none')},
-            reverse=True,
-        )
-        video_formats = [f for f in formats if f.get('height') and f.get('vcodec') not in (None, 'none')]
-        audio_formats = [f for f in formats if f.get('acodec') not in (None, 'none') and f.get('vcodec') in (None, 'none')]
-        hls_formats = [f for f in formats if 'm3u8' in (f.get('protocol') or '')]
-        return info, {
-            'cliente': cliente,
-            'status': 'OK',
-            'title': info.get('title'),
-            'id': info.get('id'),
-            'max_height': max(heights, default=0),
-            'heights': heights,
-            'format_count': len(formats),
-            'video_format_count': len(video_formats),
-            'audio_format_count': len(audio_formats),
-            'hls_format_count': len(hls_formats),
-            'logs': logs[-200:],
-        }
-    except Exception as e:
-        return None, {
-            'cliente': cliente,
-            'status': 'ERRO',
-            'error_type': type(e).__name__,
-            'error': redigir(str(e)),
-            'traceback': redigir(traceback.format_exc()),
-            'logs': logs[-200:],
-        }
-
-
-def normalize_url(url: str) -> str:
-    url = url.strip()
-    if not url:
-        raise ValueError('Informe uma URL válida.')
-    if 'youtube.com/playlist' in url:
-        raise ValueError('Playlists não são suportadas; use um vídeo individual.')
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-    for param in ('list', 'index', 'start_radio'):
-        qs.pop(param, None)
-    clean_query = urlencode(qs, doseq=True)
-    return urlunparse(parsed._replace(query=clean_query))
-
-
-def format_duration(v):
-    if not v:
-        return 'N/A'
-    v = int(v)
-    h, r = divmod(v, 3600)
-    m, s = divmod(r, 60)
-    return f'{h:02d}:{m:02d}:{s:02d}' if h else f'{m:02d}:{s:02d}'
-
-
-def format_bytes(v):
-    if v is None:
-        return 'N/A'
-    v = float(v)
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if v < 1024:
-            return f'{v:.1f} {unit}'
-        v /= 1024
-    return f'{v:.1f} TB'
-
-
-def safe_filename(name: str) -> str:
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', '', name or 'download')
-    return re.sub(r'\s+', ' ', name).strip().rstrip('. ')[:180] or 'download'
-
-
-def available_options(height: int) -> dict[str, int]:
-    if height <= 0:
-        return {}
-    usable = [x for x in RESOLUCOES if x <= height]
-    if not usable:
-        return {f'{height}p (máxima disponível)': height}
-    return {f'{x}p' + (' (máxima disponível)' if i == 0 else ''): x for i, x in enumerate(usable)}
-
-
-def download_one(
-    url: str,
-    cliente: str,
-    media: str,
-    quality: int,
-    folder: str,
-    prefer_hls: bool = False,
-    cookiefile: Optional[str] = None,
-    force_ipv4: bool = False,
-    hook=None,
-) -> dict[str, Any]:
-    logs: list[str] = []
-
-    class Logger:
-        def debug(self, msg): logs.append(redigir(msg))
-        def info(self, msg): logs.append(redigir(msg))
-        def warning(self, msg): logs.append('WARNING: ' + redigir(msg))
-        def error(self, msg): logs.append('ERROR: ' + redigir(msg))
-
-    if media == 'video':
-        if prefer_hls:
-            selector = (
-                f'bestvideo[height<={quality}][protocol*=m3u8]+bestaudio[protocol*=m3u8]/'
-                f'best[height<={quality}][protocol*=m3u8]/'
-                f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best'
-            )
-        else:
-            selector = (
-                f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/'
-                f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best'
-            )
-        extra = {'format': selector, 'merge_output_format': 'mp4'}
-        ext = '.mp4'
-    else:
-        if prefer_hls:
-            selector = 'bestaudio[protocol*=m3u8]/bestaudio/best'
-        else:
-            selector = 'bestaudio/best'
-        extra = {
-            'format': selector,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': str(quality),
-            }],
-        }
-        ext = '.mp3'
-
-    opts = yt_opts(
-        cliente,
-        download=True,
-        cookiefile=cookiefile,
-        force_ipv4=force_ipv4,
-        logger=Logger(),
-        outtmpl=str(Path(folder) / '%(title).180s.%(ext)s'),
-        progress_hooks=[hook] if hook else [],
-        **extra,
-    )
-    mode_label = 'HLS_m3u8' if prefer_hls else 'HTTPS_padrao'
-    result = {
-        'cliente': cliente,
-        'modo': mode_label,
-        'media': media,
-        'quality': quality,
-        'selector': selector,
-        'status': 'ERRO',
-        'error': None,
-        'traceback': None,
-        'logs': [],
-    }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            rc = ydl.download([url])
-        result['status'] = 'OK' if rc == 0 else f'RETORNO_{rc}'
-    except Exception as e:
-        result['error'] = {
-            'type': type(e).__name__,
-            'message': redigir(str(e)),
-            'is_403': '403' in str(e) or 'Forbidden' in str(e),
-        }
-        result['traceback'] = redigir(traceback.format_exc())
-    result['logs'] = logs[-400:]
-    result['network_hints'] = download_url_network_hints(result['logs'])
-    result['extension'] = ext
-    return result
-
-
-def build_diagnostic_report(cookies_source: str, force_ipv4: bool) -> str:
-    """Gera um relatório técnico legível em texto puro (.txt) para análise."""
-    env = get_environment_info(cookies_source=cookies_source, force_ipv4=force_ipv4)
-    lines: list[str] = [
-        '====================================================================',
-        f'RELATÓRIO DE DIAGNÓSTICO — YOUTUBE DOWNLOADER (v{APP_VERSION})',
-        '====================================================================',
-        '',
-        '## 1. INFORMAÇÕES DA APLICAÇÃO E AMBIENTE',
-    ]
-    for k, v in env.items():
-        lines.append(f'- {k}: {v}')
-
-    lines.append(f"- url_informada: {st.session_state.get('url', 'N/A')}")
-    lines.append(f"- cliente_selecionado: {st.session_state.get('selected_client', 'N/A')}")
-    if st.session_state.get('fatal_error'):
-        lines.append(f"- erro_geral: {st.session_state.get('fatal_error')}")
-
-    results = st.session_state.get('client_results', [])
-    lines.extend(['', '## 2. TESTE DE EXTRAÇÃO POR CLIENTE'])
-    if not results:
-        lines.append('Nenhuma análise de vídeo executada ainda.')
-    else:
-        for r in results:
-            lines.append(f"\n### Cliente: {r.get('cliente')} | Status: {r.get('status')}")
-            if r.get('status') == 'OK':
-                lines.append(
-                    f"Título: {r.get('title')} | Máxima: {r.get('max_height')}p | "
-                    f"Formatos: {r.get('format_count')} (Vídeo: {r.get('video_format_count')}, "
-                    f"Áudio: {r.get('audio_format_count')}, HLS: {r.get('hls_format_count')})"
-                )
-            else:
-                lines.append(f"Tipo de Erro: {r.get('error_type')}")
-                lines.append(f"Mensagem: {r.get('error')}")
-                if r.get('traceback'):
-                    lines.append('--- Traceback ---')
-                    lines.append(r['traceback'])
-            lines.append('--- Logs de Extração (últimas 80 linhas) ---')
-            lines.extend((r.get('logs') or ['Sem logs.'])[-80:])
-
-    attempts = st.session_state.get('download_attempts', [])
-    lines.extend(['', '## 3. TENTATIVAS DE DOWNLOAD (FALLBACK)'])
-    if not attempts:
-        lines.append('Nenhuma tentativa de download executada ainda.')
-    else:
-        for idx, att in enumerate(attempts, 1):
-            lines.append(
-                f"\n### Tentativa #{idx} | Cliente: {att.get('cliente')} ({att.get('modo')}) | "
-                f"Mídia: {att.get('media')} ({att.get('quality')}) | Status: {att.get('status')}"
-            )
-            lines.append(f"Seletor: {att.get('selector')}")
-            lines.append(f"Pistas de Rede: {att.get('network_hints')}")
-            if att.get('error'):
-                lines.append(f"Erro: {att['error']}")
-            if att.get('traceback'):
-                lines.append('--- Traceback ---')
-                lines.append(att['traceback'])
-            lines.append('--- Logs Reais do Download ---')
-            lines.extend(att.get('logs') or ['Sem logs.'])
-
-    lines.extend(['', '====================================================================', 'FIM DO RELATÓRIO'])
-    return '\n'.join(lines)
-
-
-def main():
-    st.title(f'🎬 YouTube Downloader — v{APP_VERSION}')
-    st.caption('Com fallback de streams HLS (m3u8) + suporte a cookies via upload ou Streamlit Secrets.')
-
-    with st.expander('⚙️ Configurações, Ambiente e Cookies', expanded=False):
-        cookies_upload = st.file_uploader(
-            'Arquivo cookies.txt (formato Netscape) — opcional se já estiver salvo nos Secrets do Streamlit',
-            type=['txt'],
-        )
-        force_ipv4 = st.checkbox(
-            'Forçar IPv4 (source_address = 0.0.0.0)',
-            value=False,
-            help='Deixe desmarcado por padrão para evitar conflito com links assinados em IPv6.',
-        )
-        cookie_preview_path, cookies_source = resolve_cookies_source(cookies_upload)
-        if cookie_preview_path and os.path.exists(cookie_preview_path):
-            os.remove(cookie_preview_path)
-        st.json(get_environment_info(cookies_source=cookies_source, force_ipv4=force_ipv4))
-
-    url = st.text_input(
-        'URL do YouTube',
-        value=st.session_state.get('url', ''),
-        placeholder='https://www.youtube.com/watch?v=...',
-    )
-    if url:
-        st.session_state['url'] = url
-
-    analyze = st.button('🔎 Analisar vídeo', type='primary', use_container_width=True)
-
-    cookie_path, cookies_source = resolve_cookies_source(cookies_upload)
-    clientes_ativos = CLIENTES_COM_COOKIES if cookie_path else CLIENTES_SEM_COOKIES
-
-    try:
-        if analyze:
-            st.session_state.pop('ready_file', None)
-            st.session_state.pop('download_attempts', None)
-            st.session_state.pop('fatal_error', None)
+        for client in clients:
+            opts = build_base_ydl_opts(client, cookiefile)
+            opts["skip_download"] = True
             try:
-                u = normalize_url(url)
-                results = []
-                infos = []
-                for client in clientes_ativos:
-                    with st.spinner(f'Testando cliente {client}...'):
-                        info, result = extract(u, client, cookiefile=cookie_path, force_ipv4=force_ipv4)
-                    results.append(result)
-                    if info:
-                        infos.append((result['max_height'], client, info))
-                st.session_state['client_results'] = results
-                st.session_state['client_infos'] = infos
-                if infos:
-                    infos.sort(key=lambda x: x[0], reverse=True)
-                    st.session_state['video_info'] = infos[0][2]
-                    st.session_state['selected_client'] = infos[0][1]
-                else:
-                    st.session_state.pop('video_info', None)
-                    st.error('Nenhum cliente conseguiu extrair informações do vídeo. Baixe o relatório abaixo e envie para análise.')
-            except Exception as e:
-                st.session_state['fatal_error'] = f'{type(e).__name__}: {e}\n{traceback.format_exc()}'
-                st.error(str(e))
-
-        results = st.session_state.get('client_results', [])
-        if results:
-            st.subheader('Resultado por cliente')
-            rows = [{
-                'Cliente': r.get('cliente'),
-                'Status': r.get('status'),
-                'Máxima': f"{r.get('max_height', 0)}p" if r.get('status') == 'OK' else '-',
-                'Formatos': r.get('format_count', '-'),
-                'HLS': r.get('hls_format_count', '-'),
-                'Erro': r.get('error', '')[:180] if r.get('status') != 'OK' else '',
-            } for r in results]
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-
-        info = st.session_state.get('video_info')
-        if info:
-            st.divider()
-            st.subheader(info.get('title') or 'Vídeo')
-            st.write(f"**Duração:** {format_duration(info.get('duration'))}")
-
-            formats = info.get('formats') or []
-            heights = sorted(
-                {int(f['height']) for f in formats if f.get('height') and f.get('vcodec') not in (None, 'none')},
-                reverse=True,
-            )
-            options = available_options(max(heights, default=0))
-
-            media_label = st.radio('Tipo de mídia', ['Vídeo MP4 (Com Áudio)', 'Apenas Áudio MP3'], horizontal=True)
-            if media_label.startswith('Vídeo'):
-                if not options:
-                    st.warning('Nenhum formato de vídeo encontrado.')
-                else:
-                    quality_label = st.selectbox('Qualidade', list(options))
-                    quality = options[quality_label]
-                    media = 'video'
-            else:
-                audio_q = st.selectbox('Qualidade do áudio', ['320 kbps', '192 kbps', '128 kbps'])
-                quality = int(audio_q.split()[0])
-                media = 'audio'
-
-            if (media_label.startswith('Apenas') or options) and st.button('⬇️ Baixar arquivo', type='primary', use_container_width=True):
-                st.session_state.pop('ready_file', None)
-                working_clients = [c for _, c, _ in st.session_state.get('client_infos', [])] or clientes_ativos
-                bar = st.progress(0)
-                status = st.empty()
-
-                def hook(data):
-                    if data.get('status') == 'downloading':
-                        total = data.get('total_bytes') or data.get('total_bytes_estimate')
-                        got = data.get('downloaded_bytes', 0)
-                        if total:
-                            p = min(max(got / total, 0), 1)
-                            bar.progress(int(p * 100))
-                            status.info(f'Baixando: {p*100:.1f}%')
-                    elif data.get('status') == 'finished':
-                        bar.progress(100)
-                        status.info('Convertendo/mesclando mídia com FFmpeg...')
-
-                plan: list[tuple[str, bool]] = []
-                if working_clients:
-                    plan.append((working_clients[0], True))
-                for c in working_clients:
-                    plan.append((c, False))
-
-                attempts = []
-                success = False
-
-                for client, prefer_hls in plan:
-                    mode_txt = 'HLS/m3u8' if prefer_hls else 'HTTPS padrão'
-                    status.info(f'Tentando download via `{client}` ({mode_txt})...')
-                    with tempfile.TemporaryDirectory(prefix='yt_v011_') as folder:
-                        result = download_one(
-                            normalize_url(url),
-                            client,
-                            media,
-                            quality,
-                            folder,
-                            prefer_hls=prefer_hls,
-                            cookiefile=cookie_path,
-                            force_ipv4=force_ipv4,
-                            hook=hook,
-                        )
-                        attempts.append(result)
-                        st.session_state['download_attempts'] = attempts
-
-                        if result['status'] == 'OK':
-                            files = [p for p in Path(folder).iterdir() if p.is_file()]
-                            if files:
-                                final = max(files, key=lambda p: p.stat().st_mtime)
-                                if final.stat().st_size > MAX_BYTES:
-                                    st.error('O arquivo ultrapassou 200 MB (limite seguro de memória na nuvem). Escolha uma resolução menor.')
-                                    break
-                                st.session_state['ready_file'] = {
-                                    'bytes': final.read_bytes(),
-                                    'name': safe_filename(info.get('title')) + ('.mp4' if media == 'video' else '.mp3'),
-                                    'mime': 'video/mp4' if media == 'video' else 'audio/mpeg',
-                                    'size': format_bytes(final.stat().st_size),
-                                    'client': f'{client} ({mode_txt})',
-                                }
-                                success = True
-                                break
-
-                if not success and attempts:
-                    last_err = attempts[-1].get('error') or {}
-                    st.error(last_err.get('message') or 'Todos os clientes falharam no download.')
-
-        ready = st.session_state.get('ready_file')
-        if ready:
-            st.success(f"Arquivo pronto ({ready['size']}) via `{ready['client']}`!")
-            st.download_button(
-                '💾 Salvar no computador',
-                ready['bytes'],
-                ready['name'],
-                ready['mime'],
-                use_container_width=True,
-                key='save_final_file',
-            )
-
-        if st.session_state.get('client_results') or st.session_state.get('download_attempts') or st.session_state.get('fatal_error'):
-            st.divider()
-            st.subheader(f'📋 Relatório de Diagnóstico (v{APP_VERSION})')
-            st.caption('Se falhar, baixe este arquivo .txt e anexe aqui no chat para avançarmos para a próxima correção.')
-            report_text = build_diagnostic_report(cookies_source=cookies_source, force_ipv4=force_ipv4)
-            st.download_button(
-                f'📄 Baixar relatório v{APP_VERSION} (.txt)',
-                report_text.encode('utf-8'),
-                f'relatorio_yt_downloader_v{APP_VERSION}.txt',
-                'text/plain',
-                use_container_width=True,
-                key='download_txt_report_v011',
-            )
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                if info and info.get("formats"):
+                    return info, client
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"Não foi possível extrair os formatos do vídeo. Detalhe: {last_error}")
     finally:
-        if cookie_path and os.path.exists(cookie_path):
-            os.remove(cookie_path)
+        if cookiefile and os.path.exists(cookiefile):
+            try:
+                os.remove(cookiefile)
+            except OSError:
+                pass
 
 
-if __name__ == '__main__':
-    main()
+def get_available_resolutions(info: dict) -> list[int]:
+    heights = set()
+    for fmt in info.get("formats") or []:
+        if fmt.get("vcodec") not in (None, "none") and fmt.get("height"):
+            h = int(fmt["height"])
+            if h >= 144:
+                heights.add(h)
+    standard = [2160, 1440, 1080, 720, 480, 360]
+    filtered = [h for h in standard if h in heights]
+    if not filtered and heights:
+        filtered = sorted(heights, reverse=True)
+    return filtered or [1080, 720, 480, 360]
+
+
+def download_media(
+    url: str,
+    mode: str,
+    resolution: int,
+    audio_bitrate: str,
+    preferred_client: str,
+    progress_callback,
+) -> Path:
+    cookiefile = get_cookie_file()
+    local_mode = is_local_windows()
+    output_dir = get_downloads_dir() if local_mode else Path(tempfile.mkdtemp(prefix="yt_dl_"))
+
+    if mode == "Vídeo (MP4)":
+        if local_mode:
+            # Localmente (IP residencial): prioriza DASH de alta resolução (4K/2K/1080p) antes do HLS
+            selectors = [
+                f"bestvideo[height<={resolution}]+bestaudio/best[height<={resolution}]/best",
+                f"bestvideo[height<={resolution}][protocol*=m3u8]+bestaudio[protocol*=m3u8]/best[height<={resolution}][protocol*=m3u8]",
+            ]
+        else:
+            # Nuvem: prioriza HLS para evitar HTTP 403 em IP de datacenter
+            selectors = [
+                f"bestvideo[height<={resolution}][protocol*=m3u8]+bestaudio[protocol*=m3u8]/best[height<={resolution}][protocol*=m3u8]/bestvideo[height<={resolution}]+bestaudio/best[height<={resolution}]/best",
+            ]
+    else:
+        selectors = [
+            "bestaudio/best",
+            "bestaudio[protocol*=m3u8]/best[protocol*=m3u8]",
+        ]
+
+    clients_to_try = [preferred_client] + [c for c in ["web_embedded", "mweb"] if c != preferred_client]
+    last_error = None
+
+    try:
+        for client in clients_to_try:
+            for fmt_selector in selectors:
+                before_files = set(output_dir.iterdir())
+                opts = build_base_ydl_opts(client, cookiefile)
+                opts["format"] = fmt_selector
+                opts["outtmpl"] = str(output_dir / "%(title).160s.%(ext)s")
+                opts["progress_hooks"] = [progress_callback]
+
+                if mode == "Vídeo (MP4)":
+                    opts["merge_output_format"] = "mp4"
+                else:
+                    opts["postprocessors"] = [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": audio_bitrate,
+                        }
+                    ]
+
+                try:
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        prepared = Path(ydl.prepare_filename(info))
+                        expected = prepared.with_suffix(".mp4" if mode == "Vídeo (MP4)" else ".mp3")
+                        if expected.exists() and expected.stat().st_size > 0:
+                            return expected
+
+                    after_files = set(output_dir.iterdir()) - before_files
+                    valid_new = [f for f in after_files if f.is_file() and f.stat().st_size > 0]
+                    if valid_new:
+                        return max(valid_new, key=lambda p: p.stat().st_mtime)
+                except Exception as exc:
+                    last_error = exc
+
+        raise RuntimeError(f"Falha ao concluir o download. Detalhe: {last_error}")
+    finally:
+        if cookiefile and os.path.exists(cookiefile):
+            try:
+                os.remove(cookiefile)
+            except OSError:
+                pass
+
+
+# Aplica plano de fundo personalizado (se configurado)
+apply_custom_background()
+
+st.title("🎬 YouTube Downloader")
+st.caption(
+    f"Versão {APP_VERSION} • "
+    + ("Modo Local (4K liberado • Salva direto em Downloads)" if is_local_windows() else "Modo Nuvem")
+)
+
+with st.expander("⚙️ Personalizar Fundo e Opções Avançadas"):
+    st.markdown("**🖼️ Imagem de Fundo**")
+    col_bg1, col_bg2 = st.columns(2)
+    with col_bg1:
+        bg_upload = st.file_uploader(
+            "Enviar imagem do computador",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="bg_uploader_widget",
+        )
+        if bg_upload is not None:
+            st.session_state["bg_file_bytes"] = bg_upload.getvalue()
+            st.session_state["bg_file_mime"] = bg_upload.type or "image/jpeg"
+    with col_bg2:
+        bg_url_input = st.text_input(
+            "Ou cole o link direto de uma imagem",
+            value=st.session_state.get("bg_image_url", ""),
+            placeholder="https://exemplo.com/imagem.jpg",
+        )
+        if bg_url_input != st.session_state.get("bg_image_url", ""):
+            st.session_state["bg_image_url"] = bg_url_input
+
+    col_op, col_clr = st.columns([3, 1])
+    with col_op:
+        opacity = st.slider(
+            "Escurecimento do fundo (para leitura)",
+            min_value=0.20,
+            max_value=0.92,
+            value=st.session_state.get("bg_overlay_opacity", 0.72),
+            step=0.04,
+        )
+        if opacity != st.session_state.get("bg_overlay_opacity", 0.72):
+            st.session_state["bg_overlay_opacity"] = opacity
+            st.rerun()
+    with col_clr:
+        st.write("")
+        if st.button("Limpar fundo", use_container_width=True):
+            st.session_state.pop("bg_file_bytes", None)
+            st.session_state.pop("bg_file_mime", None)
+            st.session_state["bg_image_url"] = ""
+            st.rerun()
+
+    st.divider()
+    st.markdown("**🍪 Cookies do YouTube (opcional no PC / necessário na nuvem)**")
+    cookies_upload = st.file_uploader(
+        "Anexar cookies.txt (formato Netscape)",
+        type=["txt"],
+        key="cookies_uploader_widget",
+    )
+    if cookies_upload is not None:
+        st.session_state["uploaded_cookies_bytes"] = cookies_upload.getvalue()
+        st.success("Arquivo cookies.txt carregado na sessão.")
+
+url = st.text_input(
+    "Cole o link do vídeo do YouTube:",
+    placeholder="https://www.youtube.com/watch?v=...",
+)
+
+if st.button("🔎 Analisar vídeo", type="primary", use_container_width=True):
+    if not url.strip():
+        st.warning("Cole um link válido do YouTube primeiro.")
+    else:
+        with st.spinner("Buscando informações e qualidades disponíveis..."):
+            try:
+                info, client_used = analyze_video(url.strip())
+                st.session_state["video_info"] = info
+                st.session_state["video_url"] = url.strip()
+                st.session_state["preferred_client"] = client_used
+            except Exception as err:
+                st.error(str(err))
+
+if "video_info" in st.session_state:
+    info = st.session_state["video_info"]
+    st.divider()
+
+    col_thumb, col_meta = st.columns([1.1, 1.5])
+    with col_thumb:
+        if info.get("thumbnail"):
+            st.image(info["thumbnail"], use_container_width=True)
+    with col_meta:
+        st.subheader(info.get("title", "Vídeo sem título"))
+        st.write(f"**Canal:** {info.get('uploader') or info.get('channel') or 'Desconhecido'}")
+        st.write(f"**Duração:** {format_duration(info.get('duration'))}")
+
+    st.write("")
+    mode = st.radio(
+        "Formato desejado:",
+        ["Vídeo (MP4)", "Áudio (MP3)"],
+        horizontal=True,
+    )
+
+    available_res = get_available_resolutions(info)
+    if mode == "Vídeo (MP4)":
+        res_labels = {
+            2160: "2160p (4K Ultra HD)",
+            1440: "1440p (2K Quad HD)",
+            1080: "1080p (Full HD)",
+            720: "720p (HD)",
+            480: "480p",
+            360: "360p",
+        }
+        selected_res = st.selectbox(
+            "Qualidade do vídeo:",
+            options=available_res,
+            format_func=lambda r: res_labels.get(r, f"{r}p"),
+        )
+        selected_bitrate = "192"
+    else:
+        selected_res = 1080
+        selected_bitrate = st.selectbox(
+            "Qualidade do áudio MP3:",
+            options=["320", "256", "192", "128"],
+            index=0,
+            format_func=lambda b: f"{b} kbps",
+        )
+
+    if st.button("⬇️ Baixar agora", type="primary", use_container_width=True):
+        progress_bar = st.progress(0, text="Iniciando transferência...")
+        status_text = st.empty()
+
+        def progress_hook(d: dict):
+            status = d.get("status")
+            if status == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                downloaded = d.get("downloaded_bytes") or 0
+                speed = d.get("_speed_str", "").strip()
+                eta = d.get("_eta_str", "").strip()
+                if total and total > 0:
+                    pct = min(max(downloaded / total, 0.0), 1.0)
+                    progress_bar.progress(
+                        pct,
+                        text=f"Baixando: {pct * 100:.1f}% • Velocidade: {speed} • Restante: {eta}",
+                    )
+                else:
+                    status_text.caption(f"Transferindo... {speed}")
+            elif status == "finished":
+                progress_bar.progress(1.0, text="Finalizando e convertendo com FFmpeg...")
+
+        try:
+            saved_path = download_media(
+                url=st.session_state["video_url"],
+                mode=mode,
+                resolution=selected_res,
+                audio_bitrate=selected_bitrate,
+                preferred_client=st.session_state.get("preferred_client", "web_embedded"),
+                progress_callback=progress_hook,
+            )
+            status_text.empty()
+            progress_bar.progress(1.0, text="Concluído!")
+
+            size_mb = saved_path.stat().st_size / (1024 * 1024)
+            if is_local_windows():
+                st.success(f"✅ Arquivo salvo direto na sua pasta Downloads ({size_mb:.1f} MB):\n\n`{saved_path}`")
+            else:
+                st.success(f"✅ Pronto! Tamanho: {size_mb:.1f} MB")
+                with open(saved_path, "rb") as f:
+                    st.download_button(
+                        label="💾 Salvar arquivo no computador",
+                        data=f.read(),
+                        file_name=saved_path.name,
+                        mime="video/mp4" if mode == "Vídeo (MP4)" else "audio/mpeg",
+                        use_container_width=True,
+                    )
+        except Exception as err:
+            st.error(str(err))
