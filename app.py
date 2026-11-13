@@ -14,7 +14,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import streamlit as st
 import yt_dlp
 
-APP_VERSION = '0.1'
+APP_VERSION = '0.1.1'
 
 st.set_page_config(page_title=f'YouTube Downloader — v{APP_VERSION}', page_icon='🎬', layout='wide')
 
@@ -97,7 +97,28 @@ def detect_js_runtimes() -> dict[str, Any]:
     return runtimes
 
 
-def get_environment_info(cookies_loaded: bool = False, force_ipv4: bool = False) -> dict[str, Any]:
+def resolve_cookies_source(uploaded_file) -> tuple[Optional[str], str]:
+    """Resolve cookies a partir do upload na interface ou de st.secrets['YOUTUBE_COOKIES']."""
+    if uploaded_file is not None:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
+        tmp.write(uploaded_file.getvalue())
+        tmp.close()
+        return tmp.name, 'upload_interface'
+
+    try:
+        secret_cookies = st.secrets.get('YOUTUBE_COOKIES', '').strip()
+        if secret_cookies:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w', encoding='utf-8')
+            tmp.write(secret_cookies + '\n')
+            tmp.close()
+            return tmp.name, 'streamlit_secrets'
+    except Exception:
+        pass
+
+    return None, 'nenhum'
+
+
+def get_environment_info(cookies_source: str = 'nenhum', force_ipv4: bool = False) -> dict[str, Any]:
     runtimes = detect_js_runtimes()
     return {
         'app_version': f'v{APP_VERSION}',
@@ -110,7 +131,7 @@ def get_environment_info(cookies_loaded: bool = False, force_ipv4: bool = False)
         'deno_check': run_cmd(['deno', '--version']) if 'deno' in runtimes else 'não encontrado',
         'node_check': run_cmd(['node', '--version']) if 'node' in runtimes else 'não encontrado',
         'ffmpeg_check': run_cmd(['ffmpeg', '-version']) if shutil.which('ffmpeg') else 'não encontrado',
-        'cookies_uploaded': cookies_loaded,
+        'cookies_source': cookies_source,
         'force_ipv4': force_ipv4,
     }
 
@@ -169,6 +190,7 @@ def extract(
         )
         video_formats = [f for f in formats if f.get('height') and f.get('vcodec') not in (None, 'none')]
         audio_formats = [f for f in formats if f.get('acodec') not in (None, 'none') and f.get('vcodec') in (None, 'none')]
+        hls_formats = [f for f in formats if 'm3u8' in (f.get('protocol') or '')]
         return info, {
             'cliente': cliente,
             'status': 'OK',
@@ -179,6 +201,7 @@ def extract(
             'format_count': len(formats),
             'video_format_count': len(video_formats),
             'audio_format_count': len(audio_formats),
+            'hls_format_count': len(hls_formats),
             'logs': logs[-200:],
         }
     except Exception as e:
@@ -246,6 +269,7 @@ def download_one(
     media: str,
     quality: int,
     folder: str,
+    prefer_hls: bool = False,
     cookiefile: Optional[str] = None,
     force_ipv4: bool = False,
     hook=None,
@@ -259,11 +283,24 @@ def download_one(
         def error(self, msg): logs.append('ERROR: ' + redigir(msg))
 
     if media == 'video':
-        selector = f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best'
+        if prefer_hls:
+            selector = (
+                f'bestvideo[height<={quality}][protocol*=m3u8]+bestaudio[protocol*=m3u8]/'
+                f'best[height<={quality}][protocol*=m3u8]/'
+                f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best'
+            )
+        else:
+            selector = (
+                f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/'
+                f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best'
+            )
         extra = {'format': selector, 'merge_output_format': 'mp4'}
         ext = '.mp4'
     else:
-        selector = 'bestaudio/best'
+        if prefer_hls:
+            selector = 'bestaudio[protocol*=m3u8]/bestaudio/best'
+        else:
+            selector = 'bestaudio/best'
         extra = {
             'format': selector,
             'postprocessors': [{
@@ -284,8 +321,10 @@ def download_one(
         progress_hooks=[hook] if hook else [],
         **extra,
     )
+    mode_label = 'HLS_m3u8' if prefer_hls else 'HTTPS_padrao'
     result = {
         'cliente': cliente,
+        'modo': mode_label,
         'media': media,
         'quality': quality,
         'selector': selector,
@@ -311,9 +350,9 @@ def download_one(
     return result
 
 
-def build_diagnostic_report(cookies_loaded: bool, force_ipv4: bool) -> str:
+def build_diagnostic_report(cookies_source: str, force_ipv4: bool) -> str:
     """Gera um relatório técnico legível em texto puro (.txt) para análise."""
-    env = get_environment_info(cookies_loaded=cookies_loaded, force_ipv4=force_ipv4)
+    env = get_environment_info(cookies_source=cookies_source, force_ipv4=force_ipv4)
     lines: list[str] = [
         '====================================================================',
         f'RELATÓRIO DE DIAGNÓSTICO — YOUTUBE DOWNLOADER (v{APP_VERSION})',
@@ -339,7 +378,8 @@ def build_diagnostic_report(cookies_loaded: bool, force_ipv4: bool) -> str:
             if r.get('status') == 'OK':
                 lines.append(
                     f"Título: {r.get('title')} | Máxima: {r.get('max_height')}p | "
-                    f"Formatos: {r.get('format_count')} (Vídeo: {r.get('video_format_count')}, Áudio: {r.get('audio_format_count')})"
+                    f"Formatos: {r.get('format_count')} (Vídeo: {r.get('video_format_count')}, "
+                    f"Áudio: {r.get('audio_format_count')}, HLS: {r.get('hls_format_count')})"
                 )
             else:
                 lines.append(f"Tipo de Erro: {r.get('error_type')}")
@@ -357,7 +397,7 @@ def build_diagnostic_report(cookies_loaded: bool, force_ipv4: bool) -> str:
     else:
         for idx, att in enumerate(attempts, 1):
             lines.append(
-                f"\n### Tentativa #{idx} | Cliente: {att.get('cliente')} | "
+                f"\n### Tentativa #{idx} | Cliente: {att.get('cliente')} ({att.get('modo')}) | "
                 f"Mídia: {att.get('media')} ({att.get('quality')}) | Status: {att.get('status')}"
             )
             lines.append(f"Seletor: {att.get('selector')}")
@@ -376,11 +416,11 @@ def build_diagnostic_report(cookies_loaded: bool, force_ipv4: bool) -> str:
 
 def main():
     st.title(f'🎬 YouTube Downloader — v{APP_VERSION}')
-    st.caption('Rede automática (sem conflito IPv4/IPv6), fallback de clientes, cookies.txt opcional e relatório .txt.')
+    st.caption('Com fallback de streams HLS (m3u8) + suporte a cookies via upload ou Streamlit Secrets.')
 
-    with st.expander('⚙️ Configurações, Ambiente e Cookies (recomendado na nuvem)', expanded=False):
+    with st.expander('⚙️ Configurações, Ambiente e Cookies', expanded=False):
         cookies_upload = st.file_uploader(
-            'Arquivo cookies.txt (formato Netscape) — recomendado se o servidor tomar bloqueio 403 do YouTube',
+            'Arquivo cookies.txt (formato Netscape) — opcional se já estiver salvo nos Secrets do Streamlit',
             type=['txt'],
         )
         force_ipv4 = st.checkbox(
@@ -388,7 +428,10 @@ def main():
             value=False,
             help='Deixe desmarcado por padrão para evitar conflito com links assinados em IPv6.',
         )
-        st.json(get_environment_info(cookies_loaded=cookies_upload is not None, force_ipv4=force_ipv4))
+        cookie_preview_path, cookies_source = resolve_cookies_source(cookies_upload)
+        if cookie_preview_path and os.path.exists(cookie_preview_path):
+            os.remove(cookie_preview_path)
+        st.json(get_environment_info(cookies_source=cookies_source, force_ipv4=force_ipv4))
 
     url = st.text_input(
         'URL do YouTube',
@@ -400,13 +443,7 @@ def main():
 
     analyze = st.button('🔎 Analisar vídeo', type='primary', use_container_width=True)
 
-    cookie_path = None
-    if cookies_upload is not None:
-        tmp_cookie = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
-        tmp_cookie.write(cookies_upload.getvalue())
-        tmp_cookie.close()
-        cookie_path = tmp_cookie.name
-
+    cookie_path, cookies_source = resolve_cookies_source(cookies_upload)
     clientes_ativos = CLIENTES_COM_COOKIES if cookie_path else CLIENTES_SEM_COOKIES
 
     try:
@@ -445,6 +482,7 @@ def main():
                 'Status': r.get('status'),
                 'Máxima': f"{r.get('max_height', 0)}p" if r.get('status') == 'OK' else '-',
                 'Formatos': r.get('format_count', '-'),
+                'HLS': r.get('hls_format_count', '-'),
                 'Erro': r.get('error', '')[:180] if r.get('status') != 'OK' else '',
             } for r in results]
             st.dataframe(rows, use_container_width=True, hide_index=True)
@@ -493,18 +531,26 @@ def main():
                         bar.progress(100)
                         status.info('Convertendo/mesclando mídia com FFmpeg...')
 
+                plan: list[tuple[str, bool]] = []
+                if working_clients:
+                    plan.append((working_clients[0], True))
+                for c in working_clients:
+                    plan.append((c, False))
+
                 attempts = []
                 success = False
 
-                for client in working_clients:
-                    status.info(f'Tentando download via cliente `{client}`...')
-                    with tempfile.TemporaryDirectory(prefix='yt_v01_') as folder:
+                for client, prefer_hls in plan:
+                    mode_txt = 'HLS/m3u8' if prefer_hls else 'HTTPS padrão'
+                    status.info(f'Tentando download via `{client}` ({mode_txt})...')
+                    with tempfile.TemporaryDirectory(prefix='yt_v011_') as folder:
                         result = download_one(
                             normalize_url(url),
                             client,
                             media,
                             quality,
                             folder,
+                            prefer_hls=prefer_hls,
                             cookiefile=cookie_path,
                             force_ipv4=force_ipv4,
                             hook=hook,
@@ -524,7 +570,7 @@ def main():
                                     'name': safe_filename(info.get('title')) + ('.mp4' if media == 'video' else '.mp3'),
                                     'mime': 'video/mp4' if media == 'video' else 'audio/mpeg',
                                     'size': format_bytes(final.stat().st_size),
-                                    'client': client,
+                                    'client': f'{client} ({mode_txt})',
                                 }
                                 success = True
                                 break
@@ -548,15 +594,15 @@ def main():
         if st.session_state.get('client_results') or st.session_state.get('download_attempts') or st.session_state.get('fatal_error'):
             st.divider()
             st.subheader(f'📋 Relatório de Diagnóstico (v{APP_VERSION})')
-            st.caption('Se algo falhar, baixe este arquivo .txt e envie aqui no chat para analisarmos o próximo ajuste.')
-            report_text = build_diagnostic_report(cookies_loaded=cookies_upload is not None, force_ipv4=force_ipv4)
+            st.caption('Se falhar, baixe este arquivo .txt e anexe aqui no chat para avançarmos para a próxima correção.')
+            report_text = build_diagnostic_report(cookies_source=cookies_source, force_ipv4=force_ipv4)
             st.download_button(
                 f'📄 Baixar relatório v{APP_VERSION} (.txt)',
                 report_text.encode('utf-8'),
                 f'relatorio_yt_downloader_v{APP_VERSION}.txt',
                 'text/plain',
                 use_container_width=True,
-                key='download_txt_report_v01',
+                key='download_txt_report_v011',
             )
     finally:
         if cookie_path and os.path.exists(cookie_path):
