@@ -8,34 +8,28 @@ import tempfile
 import traceback
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import streamlit as st
 import yt_dlp
 
-st.set_page_config(page_title='YouTube Downloader — Diagnóstico V17', page_icon='🎬', layout='wide')
+st.set_page_config(page_title='YouTube Downloader — V18 Corrigido', page_icon='🎬', layout='wide')
 
-CLIENTES = ['web_embedded', 'android', 'android_vr']
+# Clientes ordenados dos mais compatíveis sem PO Token para os mais restritos
+CLIENTES = ['tv', 'ios', 'mweb', 'android_vr', 'web_embedded', 'android']
 RESOLUCOES = [2160, 1440, 1080, 720, 480, 360, 240, 144]
-MAX_BYTES = 500 * 1024 * 1024
+MAX_BYTES = 200 * 1024 * 1024  # 200 MB evita estouro de RAM (OOM) no Streamlit Cloud
 
 
 def redigir(texto: str) -> str:
-    """Redige segredos e reduz URLs assinadas do GoogleVideo sem perder pistas úteis."""
     texto = str(texto)
 
-    # URLs assinadas do GoogleVideo podem conter sig, spc, n, expiração etc.
-    # Para o JSON que o usuário enviará ao diagnóstico, preservamos apenas
-    # host/path e alguns parâmetros úteis para investigação (ip, itag, c, mime).
     def sanitize_googlevideo(match):
         raw = match.group(0)
         try:
             u = urlparse(raw)
             q = parse_qs(u.query)
-            keep = {}
-            for key in ('ip', 'itag', 'c', 'mime'):
-                if key in q and q[key]:
-                    keep[key] = q[key][0]
+            keep = {k: q[k][0] for k in ('ip', 'itag', 'c', 'mime') if k in q and q[k]}
             query = '&'.join(f'{k}={v}' for k, v in keep.items())
             return f'{u.scheme}://{u.netloc}{u.path}' + (f'?{query}' if query else '?[PARAMETROS_OCULTOS]')
         except Exception:
@@ -56,7 +50,6 @@ def redigir(texto: str) -> str:
 
 
 def download_url_network_hints(logs: list[str]) -> dict[str, Any]:
-    """Extrai somente pistas seguras sobre a URL de mídia para o diagnóstico."""
     joined = '\n'.join(logs)
     m = re.search(r'https?://[^\s"\']*googlevideo\.com[^\s"\']*', joined, flags=re.I)
     if not m:
@@ -88,33 +81,40 @@ def run_cmd(cmd: list[str], timeout: int = 20) -> dict[str, Any]:
         return {'returncode': None, 'output': f'{type(e).__name__}: {e}'}
 
 
-def js_runtime() -> dict[str, Any]:
+def detect_js_runtimes() -> dict[str, Any]:
+    """Detecta runtimes JS disponíveis sem quebrar o app caso não existam."""
+    runtimes = {}
     deno = shutil.which('deno')
-    if not deno:
-        raise RuntimeError('Deno não foi encontrado. Verifique requirements.txt.')
-    return {'deno': deno, 'js_runtimes': {'deno': {'path': deno}}}
+    node = shutil.which('node')
+    if deno:
+        runtimes['deno'] = {'path': deno}
+    if node:
+        runtimes['node'] = {'path': node}
+    return runtimes
 
 
-def yt_opts(cliente: str, download: bool = False, **extra: Any) -> dict[str, Any]:
-    env = js_runtime()
-    opts = {
+def yt_opts(cliente: str, download: bool = False, cookiefile: Optional[str] = None, **extra: Any) -> dict[str, Any]:
+    opts: dict[str, Any] = {
         'noplaylist': True,
         'quiet': not download,
         'no_warnings': False,
         'verbose': True,
         'socket_timeout': 30,
-        'retries': 2,
-        'fragment_retries': 2,
-        'js_runtimes': env['js_runtimes'],
-        # Teste controlado: --force-ipv4 equivale a source_address=0.0.0.0.
+        'retries': 3,
+        'fragment_retries': 3,
         'source_address': '0.0.0.0',
         'extractor_args': {'youtube': {'player_client': [cliente]}},
         **extra,
     }
+    runtimes = detect_js_runtimes()
+    if runtimes:
+        opts['js_runtimes'] = runtimes
+    if cookiefile:
+        opts['cookiefile'] = cookiefile
     return opts
 
 
-def extract(url: str, cliente: str) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+def extract(url: str, cliente: str, cookiefile: Optional[str] = None) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
     logs: list[str] = []
 
     class Logger:
@@ -124,11 +124,14 @@ def extract(url: str, cliente: str) -> tuple[Optional[dict[str, Any]], dict[str,
         def error(self, msg): logs.append('ERROR: ' + redigir(msg))
 
     try:
-        opts = yt_opts(cliente, logger=Logger(), skip_download=True)
+        opts = yt_opts(cliente, cookiefile=cookiefile, logger=Logger(), skip_download=True)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         formats = info.get('formats') or []
-        heights = sorted({int(f['height']) for f in formats if f.get('height') and f.get('vcodec') not in (None, 'none')}, reverse=True)
+        heights = sorted(
+            {int(f['height']) for f in formats if f.get('height') and f.get('vcodec') not in (None, 'none')},
+            reverse=True,
+        )
         video_formats = [f for f in formats if f.get('height') and f.get('vcodec') not in (None, 'none')]
         audio_formats = [f for f in formats if f.get('acodec') not in (None, 'none') and f.get('vcodec') in (None, 'none')]
         return info, {
@@ -156,11 +159,16 @@ def extract(url: str, cliente: str) -> tuple[Optional[dict[str, Any]], dict[str,
 
 def normalize_url(url: str) -> str:
     url = url.strip()
+    if not url:
+        raise ValueError('Informe uma URL válida.')
     if 'youtube.com/playlist' in url:
         raise ValueError('Playlists não são suportadas; use um vídeo individual.')
-    if 'youtube.com/watch' in url and '&list=' in url:
-        url = url.split('&list=', 1)[0]
-    return url
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    for param in ('list', 'index', 'start_radio'):
+        qs.pop(param, None)
+    clean_query = urlencode(qs, doseq=True)
+    return urlunparse(parsed._replace(query=clean_query))
 
 
 def format_duration(v):
@@ -197,8 +205,17 @@ def available_options(height: int) -> dict[str, int]:
     return {f'{x}p' + (' (máxima disponível)' if i == 0 else ''): x for i, x in enumerate(usable)}
 
 
-def download_one(url: str, cliente: str, media: str, quality: int, folder: str, hook=None) -> dict[str, Any]:
+def download_one(
+    url: str,
+    cliente: str,
+    media: str,
+    quality: int,
+    folder: str,
+    cookiefile: Optional[str] = None,
+    hook=None,
+) -> dict[str, Any]:
     logs: list[str] = []
+
     class Logger:
         def debug(self, msg): logs.append(redigir(msg))
         def info(self, msg): logs.append(redigir(msg))
@@ -206,17 +223,25 @@ def download_one(url: str, cliente: str, media: str, quality: int, folder: str, 
         def error(self, msg): logs.append('ERROR: ' + redigir(msg))
 
     if media == 'video':
-        selector = f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best'
+        selector = f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best'
         extra = {'format': selector, 'merge_output_format': 'mp4'}
         ext = '.mp4'
     else:
         selector = 'bestaudio/best'
-        extra = {'format': selector, 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': str(quality)}]}
+        extra = {
+            'format': selector,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': str(quality),
+            }],
+        }
         ext = '.mp3'
 
     opts = yt_opts(
         cliente,
-        True,
+        download=True,
+        cookiefile=cookiefile,
         logger=Logger(),
         outtmpl=str(Path(folder) / '%(title).180s.%(ext)s'),
         progress_hooks=[hook] if hook else [],
@@ -228,45 +253,33 @@ def download_one(url: str, cliente: str, media: str, quality: int, folder: str, 
             rc = ydl.download([url])
         result['status'] = 'OK' if rc == 0 else f'RETORNO_{rc}'
     except Exception as e:
-        result['error'] = {'type': type(e).__name__, 'message': redigir(str(e)), 'is_403': '403' in str(e) or 'Forbidden' in str(e)}
+        result['error'] = {
+            'type': type(e).__name__,
+            'message': redigir(str(e)),
+            'is_403': '403' in str(e) or 'Forbidden' in str(e),
+        }
     result['logs'] = logs[-500:]
     result['network_hints'] = download_url_network_hints(result['logs'])
     result['extension'] = ext
     return result
 
 
-def build_export_payload() -> dict[str, Any]:
-    return {
-        'app': 'V17',
-        'purpose': 'diagnostico_download',
-        'yt_dlp': yt_dlp.version.__version__,
-        'python': platform.python_version(),
-        'platform': platform.platform(),
-        'force_ipv4': True,
-        'source_address': '0.0.0.0',
-        'url': st.session_state.get('url'),
-        'selected_client': st.session_state.get('selected_client'),
-        'client_results': st.session_state.get('client_results', []),
-        'last_download': st.session_state.get('last_download'),
-        'notes': {
-            'googlevideo_urls': 'URLs assinadas são sanitizadas; somente host e parâmetros úteis como ip/itag/c/mime são preservados.',
-            'credentials': 'Nenhuma senha, cookie ou token deliberado deve ser incluído no export.',
-        },
-    }
-
 def main():
-    st.title('🎬 YouTube Downloader — Diagnóstico Completo V17')
-    st.caption('Teste controlado: web_embedded/android/android_vr + IPv4 forçado + exportação JSON do diagnóstico.')
-    st.info('Use somente conteúdo que você tenha autorização para baixar ou que seja permitido pelos termos e direitos aplicáveis.')
+    st.title('🎬 YouTube Downloader — V18')
+    st.caption('Com fallback automático de clientes, suporte a cookies.txt e persistência de arquivo.')
 
-    with st.expander('Ambiente', expanded=False):
+    with st.expander('Ambiente e Cookies (opcional para evitar Erro 403 na nuvem)', expanded=False):
         st.json({
             'yt_dlp': yt_dlp.version.__version__,
             'python': platform.python_version(),
             'platform': platform.platform(),
-            'deno': run_cmd(['deno', '--version']) if shutil.which('deno') else 'não encontrado',
-            'ffmpeg': run_cmd(['ffmpeg', '-version']) if shutil.which('ffmpeg') else 'não encontrado',
+            'js_runtimes': list(detect_js_runtimes().keys()) or ['nenhum (opcional)'],
+            'ffmpeg': 'disponível' if shutil.which('ffmpeg') else 'não encontrado',
         })
+        cookies_upload = st.file_uploader(
+            'Arquivo cookies.txt (Netscape format) — necessário se o servidor receber bloqueio 403 do YouTube',
+            type=['txt'],
+        )
 
     url = st.text_input('URL do YouTube', value=st.session_state.get('url', ''), placeholder='https://www.youtube.com/watch?v=...')
     if url:
@@ -278,95 +291,81 @@ def main():
     with c2:
         diag_btn = st.button('🧪 Diagnóstico completo', use_container_width=True)
 
-    if analyze or diag_btn:
-        try:
-            u = normalize_url(url)
-            results = []
-            infos = []
-            for client in CLIENTES:
-                with st.spinner(f'Testando {client}...'):
-                    info, result = extract(u, client)
-                results.append(result)
-                if info:
-                    infos.append((result['max_height'], client, info))
-            st.session_state['client_results'] = results
-            st.session_state['client_infos'] = infos
-            if infos:
-                infos.sort(key=lambda x: x[0], reverse=True)
-                st.session_state['video_info'] = infos[0][2]
-                st.session_state['selected_client'] = infos[0][1]
-            else:
-                st.session_state.pop('video_info', None)
-        except Exception as e:
-            st.error(str(e))
+    # Salva cookies temporariamente se enviados
+    cookie_path = None
+    if cookies_upload is not None:
+        tmp_cookie = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
+        tmp_cookie.write(cookies_upload.getvalue())
+        tmp_cookie.close()
+        cookie_path = tmp_cookie.name
 
-    results = st.session_state.get('client_results', [])
-    if results:
-        st.subheader('Resultado por cliente')
-        rows = []
-        for r in results:
-            rows.append({
+    try:
+        if analyze or diag_btn:
+            st.session_state.pop('ready_file', None)
+            try:
+                u = normalize_url(url)
+                results = []
+                infos = []
+                for client in CLIENTES:
+                    with st.spinner(f'Testando cliente {client}...'):
+                        info, result = extract(u, client, cookiefile=cookie_path)
+                    results.append(result)
+                    if info:
+                        infos.append((result['max_height'], client, info))
+                st.session_state['client_results'] = results
+                st.session_state['client_infos'] = infos
+                if infos:
+                    infos.sort(key=lambda x: x[0], reverse=True)
+                    st.session_state['video_info'] = infos[0][2]
+                    st.session_state['selected_client'] = infos[0][1]
+                else:
+                    st.session_state.pop('video_info', None)
+            except Exception as e:
+                st.error(str(e))
+
+        results = st.session_state.get('client_results', [])
+        if results:
+            st.subheader('Resultado por cliente')
+            rows = [{
                 'Cliente': r.get('cliente'),
                 'Status': r.get('status'),
                 'Máxima': f"{r.get('max_height', 0)}p" if r.get('status') == 'OK' else '-',
                 'Formatos': r.get('format_count', '-'),
-                'Vídeo': r.get('video_format_count', '-'),
-                'Áudio': r.get('audio_format_count', '-'),
-                'Erro': r.get('error', '')[:220] if r.get('status') != 'OK' else '',
-            })
-        st.dataframe(rows, use_container_width=True, hide_index=True)
-        for r in results:
-            with st.expander(f"Detalhes — {r.get('cliente')}"):
-                st.json({k: v for k, v in r.items() if k not in ('logs', 'traceback')})
-                if r.get('traceback'):
-                    st.code(r['traceback'], language='text')
-                st.code('\n'.join(r.get('logs') or ['Sem logs.']), language='text')
+                'Erro': r.get('error', '')[:180] if r.get('status') != 'OK' else '',
+            } for r in results]
+            st.dataframe(rows, use_container_width=True, hide_index=True)
 
-        if diag_btn:
-            payload = {
-                'app': 'V17',
-                'force_ipv4': True,
-                'source_address': '0.0.0.0',
-                'yt_dlp': yt_dlp.version.__version__,
-                'python': platform.python_version(),
-                'platform': platform.platform(),
-                'url': normalize_url(url),
-                'results': results,
-            }
-            st.download_button('📄 Baixar diagnóstico JSON', json.dumps(payload, ensure_ascii=False, indent=2).encode(), 'diagnostico_v17.json', 'application/json', use_container_width=True)
+        info = st.session_state.get('video_info')
+        if not info:
+            return
 
-    info = st.session_state.get('video_info')
-    if not info:
-        return
+        st.divider()
+        st.subheader(info.get('title') or 'Vídeo')
+        st.write(f"**Duração:** {format_duration(info.get('duration'))}")
 
-    st.divider()
-    st.subheader(info.get('title') or 'Vídeo')
-    st.write(f"**Duração:** {format_duration(info.get('duration'))}")
-    st.write(f"**Cliente que forneceu a maior lista:** `{st.session_state.get('selected_client')}`")
+        formats = info.get('formats') or []
+        heights = sorted({int(f['height']) for f in formats if f.get('height') and f.get('vcodec') not in (None, 'none')}, reverse=True)
+        options = available_options(max(heights, default=0))
 
-    formats = info.get('formats') or []
-    heights = sorted({int(f['height']) for f in formats if f.get('height') and f.get('vcodec') not in (None, 'none')}, reverse=True)
-    options = available_options(max(heights, default=0))
-    if not options:
-        st.warning('Nenhum formato de vídeo foi retornado pelo cliente selecionado.')
-        return
+        media_label = st.radio('Tipo de mídia', ['Vídeo MP4 (Com Áudio)', 'Apenas Áudio MP3'], horizontal=True)
+        if media_label.startswith('Vídeo'):
+            if not options:
+                st.warning('Nenhum formato de vídeo encontrado.')
+                return
+            quality_label = st.selectbox('Qualidade', list(options))
+            quality = options[quality_label]
+            media = 'video'
+        else:
+            audio_q = st.selectbox('Qualidade do áudio', ['320 kbps', '192 kbps', '128 kbps'])
+            quality = int(audio_q.split()[0])
+            media = 'audio'
 
-    media_label = st.radio('Tipo de mídia', ['Vídeo MP4 (Com Áudio)', 'Apenas Áudio MP3'], horizontal=True)
-    if media_label.startswith('Vídeo'):
-        quality_label = st.selectbox('Qualidade', list(options))
-        quality = options[quality_label]
-        media = 'video'
-        st.caption(f'Máxima encontrada na resposta selecionada: **{max(heights)}p**.')
-    else:
-        audio_q = st.selectbox('Qualidade do áudio', ['320 kbps', '192 kbps', '128 kbps'])
-        quality = int(audio_q.split()[0])
-        media = 'audio'
-
-    if st.button('⬇️ Baixar arquivo', type='primary', use_container_width=True):
-        client = st.session_state.get('selected_client')
-        with tempfile.TemporaryDirectory(prefix='yt_v16_') as folder:
+        if st.button('⬇️ Baixar arquivo', type='primary', use_container_width=True):
+            # Monta lista de clientes que funcionaram na análise para tentar com fallback
+            working_clients = [c for _, c, _ in st.session_state.get('client_infos', [])] or CLIENTES
             bar = st.progress(0)
             status = st.empty()
+
             def hook(data):
                 if data.get('status') == 'downloading':
                     total = data.get('total_bytes') or data.get('total_bytes_estimate')
@@ -377,41 +376,58 @@ def main():
                         status.info(f'Baixando: {p*100:.1f}%')
                 elif data.get('status') == 'finished':
                     bar.progress(100)
-                    status.info('Download do fluxo concluído; finalizando...')
-            result = download_one(normalize_url(url), client, media, quality, folder, hook)
-            st.session_state['last_download'] = result
-            if result['status'] == 'OK':
-                files = [p for p in Path(folder).iterdir() if p.is_file()]
-                if not files:
-                    st.error('O yt-dlp informou sucesso, mas nenhum arquivo foi encontrado.')
-                else:
-                    final = max(files, key=lambda p: p.stat().st_mtime)
-                    if final.stat().st_size > MAX_BYTES:
-                        st.error('O arquivo final ultrapassou 500 MB.')
-                    else:
-                        st.success(f'Arquivo pronto — {format_bytes(final.stat().st_size)}')
-                        st.download_button('💾 Salvar no computador', final.read_bytes(), safe_filename(info.get('title')) + ('.mp4' if media == 'video' else '.mp3'), 'video/mp4' if media == 'video' else 'audio/mpeg', use_container_width=True)
-            else:
-                st.error(result.get('error', {}).get('message') or 'Falha no download.')
-                with st.expander('Log real do download', expanded=True):
-                    st.json({k: v for k, v in result.items() if k != 'logs'})
-                    st.code('\n'.join(result.get('logs') or ['Sem logs.']), language='text')
+                    status.info('Convertendo/mesclando mídia com FFmpeg...')
 
-    # Exportação separada do último download: este é o arquivo recomendado
-    # para o usuário anexar no chat quando precisarmos analisar um 403.
-    if st.session_state.get('last_download'):
-        st.divider()
-        st.subheader('📦 Enviar diagnóstico ao ChatGPT')
-        st.caption('Baixe este JSON e anexe-o na conversa. Ele contém o log do download e as informações técnicas necessárias, com URLs assinadas sanitizadas.')
-        export = build_export_payload()
-        st.download_button(
-            '📄 Baixar JSON do log do download',
-            json.dumps(export, ensure_ascii=False, indent=2).encode('utf-8'),
-            'log_download_v17.json',
-            'application/json',
-            use_container_width=True,
-            key='download_log_json_v17',
-        )
+            success = False
+            last_result = None
+
+            for client in working_clients:
+                status.info(f'Tentando download via cliente `{client}`...')
+                with tempfile.TemporaryDirectory(prefix='yt_v18_') as folder:
+                    result = download_one(
+                        normalize_url(url), client, media, quality, folder, cookiefile=cookie_path, hook=hook
+                    )
+                    last_result = result
+                    st.session_state['last_download'] = result
+
+                    if result['status'] == 'OK':
+                        files = [p for p in Path(folder).iterdir() if p.is_file()]
+                        if files:
+                            final = max(files, key=lambda p: p.stat().st_mtime)
+                            if final.stat().st_size > MAX_BYTES:
+                                st.error('O arquivo ultrapassou 200 MB (limite seguro de memória na nuvem). Escolha uma resolução menor.')
+                                break
+                            st.session_state['ready_file'] = {
+                                'bytes': final.read_bytes(),
+                                'name': safe_filename(info.get('title')) + ('.mp4' if media == 'video' else '.mp3'),
+                                'mime': 'video/mp4' if media == 'video' else 'audio/mpeg',
+                                'size': format_bytes(final.stat().st_size),
+                                'client': client,
+                            }
+                            success = True
+                            break
+
+            if not success and last_result:
+                st.error(last_result.get('error', {}).get('message') or 'Todos os clientes falharam no download.')
+                with st.expander('Log do último erro', expanded=True):
+                    st.code('\n'.join(last_result.get('logs') or ['Sem logs.']), language='text')
+
+        # Renderiza o botão de salvar FORA do bloco do botão de baixar para não sumir no rerun
+        ready = st.session_state.get('ready_file')
+        if ready:
+            st.success(f"Arquivo pronto ({ready['size']}) via `{ready['client']}`!")
+            st.download_button(
+                '💾 Salvar no computador',
+                ready['bytes'],
+                ready['name'],
+                ready['mime'],
+                use_container_width=True,
+                key='save_final_file',
+            )
+    finally:
+        if cookie_path and os.path.exists(cookie_path):
+            os.remove(cookie_path)
+
 
 if __name__ == '__main__':
     main()
